@@ -3,8 +3,9 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     Bytes, BytesN, Env, String, Symbol, Vec,
 };
+extern crate alloc;
 
-use crate::deterministic_hash::{compute_payload_hash, verify_payload_hash};
+use crate::deterministic_hash::{compute_payload_hash, make_storage_key, verify_payload_hash};
 use crate::errors::ErrorCode;
 use crate::rate_limiter::RateLimiter;
 use crate::sep10_jwt;
@@ -23,7 +24,6 @@ pub struct Session {
     pub nonce: u64,
     pub operation_count: u64,
     pub session_ttl_seconds: u64,
-
     pub closed: bool,
 }
 
@@ -120,17 +120,65 @@ pub struct TracingContext {
     pub next_span_index: u32,
 }
 
+/// Unified attestor profile — single source of truth for all attestor metadata.
+///
+/// Replaces the separate `ENDPOINT`, `WEBHOOK`, and `SERVICES` storage keys.
+/// All profile fields are updated atomically through `set_endpoint`,
+/// `register_webhook`, and `configure_services`.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestorProfile {
+    pub attestor: Address,
+    /// HTTPS endpoint URL (empty string = not set).
+    pub endpoint: String,
+    /// Webhook URL (empty string = not set).
+    pub webhook_url: String,
+    /// Supported service type codes (see `SERVICE_*` constants).
+    pub services: Vec<u32>,
+    /// Whether this attestor is currently enabled.
+    pub enabled: bool,
+    /// Ledger timestamp of the last profile update.
+    pub updated_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct AnchorServices {
     pub anchor: Address,
     pub services: Vec<u32>,
+    /// Schema version of the service-capability set (#239). Records are always
+    /// stamped with the version under which they were configured so capability
+    /// discovery is explicit and forward-compatible.
+    pub service_capability_version: u32,
 }
 
 pub const SERVICE_DEPOSITS: u32 = 1;
 pub const SERVICE_WITHDRAWALS: u32 = 2;
 pub const SERVICE_QUOTES: u32 = 3;
 pub const SERVICE_KYC: u32 = 4;
+
+/// Current on-chain service-capability schema version (#239).
+///
+/// This constant gates which service codes the contract recognises and is the
+/// anchor point for backwards-compatible evolution of the capability set:
+///
+/// - **Adding a service identifier** — extend the recognised code range
+///   ([`MAX_KNOWN_SERVICE_CODE`]) and bump this constant. New codes then become
+///   acceptable to [`configure_services_versioned`].
+/// - **Forward safety** — `configure_services_versioned` rejects any version
+///   *newer* than this constant, so a contract never stores a capability set it
+///   cannot interpret.
+/// - **Preserving existing anchors** — records written under an older version
+///   stay readable and usable: their codes are always a subset of the current
+///   recognised range, so [`supports_service`] and routing keep working without
+///   a forced re-configuration.
+pub const SERVICE_CAPABILITY_VERSION: u32 = 1;
+
+/// Highest service code recognised by [`SERVICE_CAPABILITY_VERSION`]. Codes
+/// outside `SERVICE_DEPOSITS..=MAX_KNOWN_SERVICE_CODE` are rejected by
+/// [`configure_services_versioned`]. Extend this (and bump the version) to
+/// introduce new service identifiers.
+const MAX_KNOWN_SERVICE_CODE: u32 = SERVICE_KYC;
 
 /// Typed representation of a service capability an anchor can support.
 ///
@@ -282,7 +330,7 @@ pub struct KycRecord {
 // ---------------------------------------------------------------------------
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct AnchorMetadata {
     pub anchor: Address,
     pub reputation_score: u32,
@@ -303,6 +351,25 @@ pub struct MetadataCache {
     pub stale_ttl_seconds: u64,
     /// Set to `true` when the entry is within the stale window; caller should refresh.
     pub needs_refresh: bool,
+}
+
+/// Explicit lifecycle state of a metadata cache entry under the
+/// stale-while-revalidate (SWR) policy. Returned by
+/// [`AnchorKitContract::get_metadata_cache_state`] so callers can branch on
+/// freshness without triggering a panic on an expired/absent entry.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum MetadataCacheState {
+    /// No entry exists for the anchor.
+    Missing = 0,
+    /// Within the primary TTL — safe to use as-is.
+    Fresh = 1,
+    /// Past the primary TTL but within the stale grace window — usable, but the
+    /// caller should kick off a background refresh.
+    Stale = 2,
+    /// Past both the primary TTL and the stale window — must not be served.
+    Expired = 3,
 }
 
 #[contracttype]
@@ -548,27 +615,58 @@ const INSTANCE_TTL: u32 = 518_400;
 /// Default session lifetime in seconds (1 hour). Used when session_ttl_seconds is zero.
 pub const DEFAULT_SESSION_TTL: u64 = 3600;
 
+/// Maximum operations allowed per session before it is considered exhausted.
+pub const MAX_OPS_PER_SESSION: u64 = 100;
+
 /// Minimum TTL for replay-protection entries (7 days in ledgers at ~5 s/ledger).
 pub const REPLAY_TTL: u32 = 120_960;
 
 // ---------------------------------------------------------------------------
-// Storage key helpers
+// Storage key helpers — all keys go through make_storage_key for collision
+// resistance (#229). Each namespace uses a unique prefix byte slice.
 // ---------------------------------------------------------------------------
 
-fn admin_key(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Symbol> {
-    soroban_sdk::vec![env, symbol_short!("ADMIN")]
+fn admin_key(env: &Env) -> BytesN<32> {
+    make_storage_key(env, &[b"ADMIN"])
 }
 
-fn kyc_record_key(subject: &Address) -> (Symbol, Address) {
-    (symbol_short!("KYC"), subject.clone())
+fn initialized_key(env: &Env) -> BytesN<32> {
+    make_storage_key(env, &[b"INITIALIZED"])
 }
 
-fn compliance_check_key(subject: &Address, check_type: &String) -> (Symbol, Address, String) {
-    (symbol_short!("COMP"), subject.clone(), check_type.clone())
+fn kyc_record_key(env: &Env, subject: &Address) -> BytesN<32> {
+    let xdr = subject.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    make_storage_key(env, &[b"KYC", &raw])
+}
+
+fn compliance_check_key(env: &Env, subject: &Address, check_type: &String) -> BytesN<32> {
+    let xdr = subject.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    let mut ct_bytes = alloc::vec::Vec::with_capacity(check_type.len() as usize);
+    for i in 0..check_type.len() {
+        ct_bytes.push(check_type.get(i).unwrap_or(0));
+    }
+    make_storage_key(env, &[b"COMP", &raw, &ct_bytes])
+}
+
+fn anchor_meta_key(env: &Env, anchor: &Address) -> BytesN<32> {
+    let xdr = anchor.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    make_storage_key(env, &[b"ANCHMETA", &raw])
+}
+
+/// Convert a Soroban `Bytes` value to a native `Vec<u8>` for use in key helpers.
+fn xdr_to_vec(b: &Bytes) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(b.len() as usize);
+    for i in 0..b.len() {
+        v.push(b.get(i).unwrap_or(0));
+    }
+    v
 }
 
 fn anchor_meta_opt(env: &Env, anchor: &Address) -> Option<RoutingAnchorMeta> {
-    env.storage().persistent().get(&(symbol_short!("ANCHMETA"), anchor.clone()))
+    env.storage().persistent().get(&anchor_meta_key(env, anchor))
 }
 
 // ---------------------------------------------------------------------------
@@ -623,14 +721,20 @@ impl AnchorKitContract {
     // Initialization
     // -----------------------------------------------------------------------
 
+    /// Initialize the contract with an admin address. Can only be called once.
+    /// Panics with `AlreadyInitialized` on any subsequent call.
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
-        let inst = env.storage().instance();
-        if inst.has(&admin_key(&env)) {
+        // #228: dedicated initialized flag in persistent storage prevents
+        // re-initialization after upgrade.
+        let init_key = initialized_key(&env);
+        if env.storage().persistent().has(&init_key) {
             panic_with_error!(&env, ErrorCode::AlreadyInitialized);
         }
-        inst.set(&admin_key(&env), &admin);
-        inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+        env.storage().persistent().set(&init_key, &true);
+        env.storage().persistent().extend_ttl(&init_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.storage().instance().set(&admin_key(&env), &admin);
+        env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -645,8 +749,8 @@ impl AnchorKitContract {
     // -----------------------------------------------------------------------
 
     /// Storage key for the contract version record.
-    fn version_key(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Symbol> {
-        soroban_sdk::vec![env, symbol_short!("VERSION")]
+    fn version_key(env: &Env) -> BytesN<32> {
+        make_storage_key(env, &[b"VERSION"])
     }
 
     /// Return the current contract version.
@@ -665,34 +769,26 @@ impl AnchorKitContract {
     }
 
     /// Upgrade the contract WASM to `new_wasm_hash`.
-    ///
-    /// Requires admin authorization. After the WASM is swapped the contract
-    /// version patch component is incremented, the upgrade timestamp is
-    /// recorded, and an `UpgradeEvent` is emitted for auditability.
-    ///
-    /// Callers should invoke `migrate` immediately after this function returns
-    /// to apply any state-schema changes required by the new WASM.
+    /// Requires admin authorization and that the contract is already initialized.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        // #228: must be initialized before upgrade is permitted
+        if !env.storage().persistent().has(&initialized_key(&env)) {
+            panic_with_error!(&env, ErrorCode::NotInitialized);
+        }
         Self::require_admin(&env);
 
         let now = env.ledger().timestamp();
         let old_version = Self::get_version(env.clone());
 
-        // Capture the current WASM hash before the upgrade for the event.
-        // Soroban does not expose a direct "current wasm hash" getter, so we
-        // store the new hash as the canonical record and use a sentinel for the
-        // old hash on first upgrade.
-        let old_hash_key = soroban_sdk::vec![&env, symbol_short!("OLDHASH")];
+        let old_hash_key = make_storage_key(&env, &[b"OLDHASH"]);
         let old_wasm_hash: BytesN<32> = env
             .storage()
             .instance()
             .get::<_, BytesN<32>>(&old_hash_key)
             .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]));
 
-        // Perform the WASM upgrade.
         env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
-        // Bump version and persist.
         let new_version = old_version.bump_patch(now);
         env.storage()
             .instance()
@@ -701,7 +797,6 @@ impl AnchorKitContract {
             .instance()
             .extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
 
-        // Remember the new hash so the next upgrade can report it as "old".
         env.storage()
             .instance()
             .set(&old_hash_key, &new_wasm_hash.clone());
@@ -720,47 +815,20 @@ impl AnchorKitContract {
     }
 
     /// Idempotent post-upgrade migration hook.
-    ///
-    /// Call this immediately after `upgrade` to apply any state-schema changes
-    /// required by the new WASM. The function is safe to call multiple times —
-    /// it checks a migration nonce stored in instance storage and skips work
-    /// that has already been applied.
-    ///
-    /// Requires admin authorization.
+    /// Requires admin authorization and that the contract is already initialized.
     pub fn migrate(env: Env) {
+        // #228: migrate must not run before initialization
+        if !env.storage().persistent().has(&initialized_key(&env)) {
+            panic_with_error!(&env, ErrorCode::NotInitialized);
+        }
         Self::require_admin(&env);
 
         let version = Self::get_version(env.clone());
-        // Migration nonce key: "MIGNONCE" + patch level ensures each patch
-        // migration runs exactly once.
-        let nonce_key = (symbol_short!("MIGNONCE"), version.patch);
+        let nonce_key = make_storage_key(&env, &[b"MIGNONCE", &version.patch.to_be_bytes()]);
         if env.storage().instance().has(&nonce_key) {
-            // Already migrated for this version — idempotent no-op.
             return;
         }
 
-        // ── Version-specific migration logic (#247) ────────────────────────
-        //
-        // Pattern for schema migrations:
-        //
-        //   match version.patch {
-        //     1 => {
-        //       // Patch 1 introduced `schema_version` on Attestation/Quote/KycRecord.
-        //       // Old records (V0, no schema_version field) cannot be decoded into
-        //       // the new type directly.  Migration steps:
-        //       //   1. Read the old type with the old struct definition (requires a
-        //       //      versioned wrapper enum or a separate "V0" type declared here).
-        //       //   2. Re-construct the new type with schema_version = SCHEMA_V1.
-        //       //   3. Write back under the same storage key.
-        //       // This is a no-op placeholder; wire in concrete key ranges when
-        //       // an actual patch that changes the persisted shape is deployed.
-        //     }
-        //     _ => {}
-        //   }
-        //
-        // ───────────────────────────────────────────────────────────────────
-
-        // Mark migration as complete for this patch level.
         env.storage().instance().set(&nonce_key, &true);
         env.storage()
             .instance()
@@ -832,6 +900,32 @@ impl AnchorKitContract {
         RequestId { id, created_at: ts }
     }
 
+    /// Generate a deterministic child request ID from a root request's bytes and a nonce.
+    ///
+    /// ID = sha256(root_bytes || nonce_u64_be || ledger_timestamp_u64_be)[:16]
+    ///
+    /// This ensures child IDs are:
+    /// - deterministic given the same inputs
+    /// - unique across different nonces / timestamps
+    /// - cryptographically bound to the root request
+    pub fn generate_child_request_id(env: Env, root_bytes: Bytes, nonce: u64) -> RequestId {
+        let ts = env.ledger().timestamp();
+        let mut input = root_bytes;
+        for b in nonce.to_be_bytes().iter() {
+            input.push_back(*b);
+        }
+        for b in ts.to_be_bytes().iter() {
+            input.push_back(*b);
+        }
+        let hash = env.crypto().sha256(&input);
+        let mut id = Bytes::new(&env);
+        let hash_bytes = hash.to_array();
+        for b in hash_bytes.iter().take(16) {
+            id.push_back(*b);
+        }
+        RequestId { id, created_at: ts }
+    }
+
     // -----------------------------------------------------------------------
     // Attestor management
     // -----------------------------------------------------------------------
@@ -843,11 +937,50 @@ impl AnchorKitContract {
         if public_key.len() != 32 {
             panic_with_error!(&env, ErrorCode::ValidationError);
         }
-        let storage_key = (symbol_short!("SEP10KEY"), issuer.clone());
+        let xdr = issuer.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let storage_key = make_storage_key(&env, &[b"SEP10KEY", &raw]);
         env.storage().persistent().set(&storage_key, &public_key);
         env.storage()
             .persistent()
             .extend_ttl(&storage_key, PERSISTENT_TTL, PERSISTENT_TTL);
+    }
+
+    /// Rotate the SEP-10 issuer key for `issuer` to `new_public_key`.
+    ///
+    /// Requires admin authorization. The old key is replaced atomically; any
+    /// subsequent `verify_sep10_token` call will use the new key. The previous
+    /// key is stored under `"SEP10OLD"` for one TTL period to allow in-flight
+    /// tokens signed with the old key to drain gracefully.
+    pub fn rotate_sep10_key(env: Env, issuer: Address, new_public_key: Bytes) {
+        Self::require_admin(&env);
+        if new_public_key.len() != 32 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        let storage_key = (symbol_short!("SEP10KEY"), issuer.clone());
+        // Preserve old key for graceful drain
+        if let Some(old_key) = env.storage().persistent().get::<_, Bytes>(&storage_key) {
+            let old_key_storage = (symbol_short!("SEP10OLD"), issuer.clone());
+            env.storage().persistent().set(&old_key_storage, &old_key);
+            env.storage()
+                .persistent()
+                .extend_ttl(&old_key_storage, PERSISTENT_TTL, PERSISTENT_TTL);
+        }
+        env.storage().persistent().set(&storage_key, &new_public_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&storage_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.events().publish(
+            (symbol_short!("sep10key"), symbol_short!("rotated"), issuer),
+            (),
+        );
+    }
+
+    /// Return the current SEP-10 verifying key for `issuer`, or `None` if not set.
+    pub fn get_sep10_key(env: Env, issuer: Address) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&(symbol_short!("SEP10KEY"), issuer))
     }
 
     /// Configure the maximum JWT length accepted by `verify_sep10_jwt` (issue #64).
@@ -898,10 +1031,12 @@ impl AnchorKitContract {
 
     /// Verifies a SEP-10 JWT (JWS compact, EdDSA) using the stored key for `issuer`: signature, `exp`, and `sub`.
     pub fn verify_sep10_token(env: Env, token: String, issuer: Address) {
+        let xdr = issuer.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         let pk: Bytes = env
             .storage()
             .persistent()
-            .get(&(symbol_short!("SEP10KEY"), issuer.clone()))
+            .get(&make_storage_key(&env, &[b"SEP10KEY", &raw]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::InvalidSep10Token));
         if sep10_jwt::verify_sep10_jwt(&env, &token, &pk, None).is_err() {
             panic_with_error!(&env, ErrorCode::InvalidSep10Token);
@@ -914,10 +1049,12 @@ impl AnchorKitContract {
         issuer: &Address,
         attestor: &Address,
     ) {
+        let xdr = issuer.clone().to_xdr(env);
+        let raw = xdr_to_vec(&xdr);
         let pk: Bytes = env
             .storage()
             .persistent()
-            .get(&(symbol_short!("SEP10KEY"), issuer.clone()))
+            .get(&make_storage_key(env, &[b"SEP10KEY", &raw]))
             .unwrap_or_else(|| panic_with_error!(env, ErrorCode::InvalidSep10Token));
         let expected = attestor.to_string();
         if sep10_jwt::verify_sep10_jwt(env, token, &pk, Some(&expected)).is_err() {
@@ -925,23 +1062,18 @@ impl AnchorKitContract {
         }
     }
 
-    /// Verify a SEP-10 JWT for an arbitrary subject without going through the
-    /// attestor registration flow. Useful for off-chain clients that hold a
-    /// stored verifying key and want to confirm token ownership.
-    ///
-    /// Panics with `InvalidSep10Token` if:
-    /// - no verifying key is stored for `issuer`
-    /// - the token signature, expiry, or `sub` claim does not match `subject`
     pub fn verify_sep10_token_for_subject(
         env: Env,
         token: String,
         issuer: Address,
         subject: Address,
     ) {
+        let xdr = issuer.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         let pk: Bytes = env
             .storage()
             .persistent()
-            .get(&(symbol_short!("SEP10KEY"), issuer.clone()))
+            .get(&make_storage_key(&env, &[b"SEP10KEY", &raw]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::InvalidSep10Token));
         let expected = subject.to_string();
         if sep10_jwt::verify_sep10_jwt(&env, &token, &pk, Some(&expected)).is_err() {
@@ -952,7 +1084,9 @@ impl AnchorKitContract {
     pub fn register_attestor(env: Env, attestor: Address, sep10_token: String, sep10_issuer: Address, public_key: BytesN<32>) {
         Self::require_admin(&env);
         Self::verify_sep10_token_matches_attestor(&env, &sep10_token, &sep10_issuer, &attestor);
-        let key = (symbol_short!("ATTESTOR"), attestor.clone());
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let key = make_storage_key(&env, &[b"ATTESTOR", &raw]);
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, ErrorCode::AttestorAlreadyRegistered);
         }
@@ -960,7 +1094,7 @@ impl AnchorKitContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
-        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
         env.storage().persistent().set(&pk_key, &public_key);
         env.storage()
             .persistent()
@@ -973,12 +1107,14 @@ impl AnchorKitContract {
 
     pub fn revoke_attestor(env: Env, attestor: Address) {
         Self::require_admin(&env);
-        let key = (symbol_short!("ATTESTOR"), attestor.clone());
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let key = make_storage_key(&env, &[b"ATTESTOR", &raw]);
         if !env.storage().persistent().has(&key) {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
         env.storage().persistent().remove(&key);
-        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
         env.storage().persistent().remove(&pk_key);
         env.events().publish(
             (symbol_short!("attestor"), symbol_short!("removed"), attestor),
@@ -986,62 +1122,97 @@ impl AnchorKitContract {
         );
     }
 
-pub fn is_attestor(env: Env, attestor: Address) -> bool {
+    pub fn is_attestor(env: Env, attestor: Address) -> bool {
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         env.storage()
             .persistent()
-            .get::<_, bool>(&(symbol_short!("ATTESTOR"), attestor))
+            .get::<_, bool>(&make_storage_key(&env, &[b"ATTESTOR", &raw]))
             .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Attestor profile helpers
+    // -----------------------------------------------------------------------
+
+    fn profile_key(attestor: &Address) -> (Symbol, Address) {
+        (symbol_short!("PROFILE"), attestor.clone())
+    }
+
+    fn load_or_init_profile(env: &Env, attestor: &Address) -> AttestorProfile {
+        let key = Self::profile_key(attestor);
+        env.storage()
+            .persistent()
+            .get::<_, AttestorProfile>(&key)
+            .unwrap_or(AttestorProfile {
+                attestor: attestor.clone(),
+                endpoint: String::from_str(env, ""),
+                webhook_url: String::from_str(env, ""),
+                services: Vec::new(env),
+                enabled: true,
+                updated_at: 0,
+            })
+    }
+
+    fn save_profile(env: &Env, profile: &AttestorProfile) {
+        let key = Self::profile_key(&profile.attestor);
+        env.storage().persistent().set(&key, profile);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+    }
+
+    /// Return the unified `AttestorProfile` for an attestor.
+    pub fn get_attestor_profile(env: Env, attestor: Address) -> AttestorProfile {
+        if !Self::is_attestor(env.clone(), attestor.clone()) {
+            panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
+        }
+        Self::load_or_init_profile(&env, &attestor)
     }
 
     // -----------------------------------------------------------------------
     // Attestor endpoint management
     // -----------------------------------------------------------------------
 
-    /// Set the attestor&#39;s HTTPS endpoint URL (validated via validate_anchor_domain).
-    /// Only the attestor themselves can update their endpoint.
     pub fn set_endpoint(env: Env, attestor: Address, endpoint: String) {
         attestor.require_auth();
         Self::check_attestor(&env, &attestor);
         let endpoint_str = Self::soroban_string_to_rust_string(&env, &endpoint);
         crate::validate_anchor_domain(&endpoint_str)
             .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
-        let key = (symbol_short!("ENDPOINT"), attestor.clone());
-        env.storage().persistent().set(&key, &endpoint);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        let now = env.ledger().timestamp();
+        let mut profile = Self::load_or_init_profile(&env, &attestor);
+        profile.endpoint = endpoint.clone();
+        profile.updated_at = now;
+        Self::save_profile(&env, &profile);
         env.events().publish(
             (symbol_short!("endpoint"), symbol_short!("updated")),
-            EndpointUpdated {
-                attestor,
-                endpoint,
-            },
+            EndpointUpdated { attestor, endpoint },
         );
     }
 
-    /// Retrieve the attestor&#39;s stored endpoint URL.
     pub fn get_endpoint(env: Env, attestor: Address) -> String {
         if !Self::is_attestor(env.clone(), attestor.clone()) {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         env.storage().persistent()
-            .get::<_, String>(&(symbol_short!("ENDPOINT"), attestor))
+            .get::<_, String>(&make_storage_key(&env, &[b"ENDPOINT", &raw]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered))
     }
 
-    // -----------------------------------------------------------------------
-    // Webhook endpoint management
-    // -----------------------------------------------------------------------
-
-    /// Register a webhook URL for an attestor (attestor-auth).
-    /// Validates the webhook URL via validate_anchor_domain.
     pub fn register_webhook(env: Env, attestor: Address, webhook_url: String) {
         attestor.require_auth();
         Self::check_attestor(&env, &attestor);
         let webhook_url_str = Self::soroban_string_to_rust_string(&env, &webhook_url);
         crate::validate_anchor_domain(&webhook_url_str)
             .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
-        let key = (symbol_short!("WEBHOOK"), attestor.clone());
-        env.storage().persistent().set(&key, &webhook_url);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        let now = env.ledger().timestamp();
+        let mut profile = Self::load_or_init_profile(&env, &attestor);
+        profile.webhook_url = webhook_url.clone();
+        profile.updated_at = now;
+        Self::save_profile(&env, &profile);
         env.events().publish(
             (symbol_short!("webhook"), symbol_short!("reg")),
             EndpointUpdated {
@@ -1051,13 +1222,14 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         );
     }
 
-    /// Retrieve the webhook URL for an attestor.
     pub fn get_webhook_url(env: Env, attestor: Address) -> String {
         if !Self::is_attestor(env.clone(), attestor.clone()) {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         env.storage().persistent()
-            .get::<_, String>(&(symbol_short!("WEBHOOK"), attestor))
+            .get::<_, String>(&make_storage_key(&env, &[b"WEBHOOK", &raw]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered))
     }
 
@@ -1065,14 +1237,42 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     // Service configuration
     // -----------------------------------------------------------------------
 
+    /// Configure an anchor's supported services using the contract's current
+    /// capability version ([`SERVICE_CAPABILITY_VERSION`]). Equivalent to
+    /// [`configure_services_versioned`](Self::configure_services_versioned) with
+    /// `version = SERVICE_CAPABILITY_VERSION`.
     pub fn configure_services(env: Env, anchor: Address, services: Vec<u32>) {
+        Self::configure_services_versioned(env, anchor, services, SERVICE_CAPABILITY_VERSION);
+    }
+
+    /// Configure an anchor's supported services under an explicit capability
+    /// version (#239).
+    ///
+    /// Rejects (panics) when:
+    /// - the anchor is not a registered attestor (`AttestorNotRegistered`)
+    /// - `version` is `0` or newer than [`SERVICE_CAPABILITY_VERSION`]
+    ///   (`UnsupportedCapabilityVersion`) — the contract refuses capability sets
+    ///   it cannot interpret
+    /// - the service list is empty, contains duplicates, or contains a code the
+    ///   current version does not recognise (`InvalidServiceType`)
+    ///
+    /// On success the record is stored stamped with `version` so capability
+    /// discovery is explicit. Re-configuring overwrites the previous record,
+    /// which is how an anchor migrates to a newer version.
+    pub fn configure_services_versioned(
+        env: Env,
+        anchor: Address,
+        services: Vec<u32>,
+        version: u32,
+    ) {
         anchor.require_auth();
-        if !env
-            .storage()
-            .persistent()
-            .has(&(symbol_short!("ATTESTOR"), anchor.clone()))
-        {
+        let xdr = anchor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        if !env.storage().persistent().has(&make_storage_key(&env, &[b"ATTESTOR", &raw])) {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
+        }
+        if version == 0 || version > SERVICE_CAPABILITY_VERSION {
+            panic_with_error!(&env, ErrorCode::UnsupportedCapabilityVersion);
         }
         if services.is_empty() {
             panic_with_error!(&env, ErrorCode::InvalidServiceType);
@@ -1082,33 +1282,51 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             if seen.contains(&s) {
                 panic_with_error!(&env, ErrorCode::InvalidServiceType);
             }
+            if !Self::is_known_service_code(s) {
+                panic_with_error!(&env, ErrorCode::InvalidServiceType);
+            }
             seen.push_back(s);
         }
-        let record = AnchorServices {
-            anchor: anchor.clone(),
-            services: services.clone(),
-        };
-        let key = (symbol_short!("SERVICES"), anchor.clone());
+        let record = AnchorServices { anchor: anchor.clone(), services: services.clone() };
+        let key = make_storage_key(&env, &[b"SERVICES", &raw]);
         env.storage().persistent().set(&key, &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
-        env.events()
-            .publish((symbol_short!("services"), symbol_short!("config")), record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.events().publish((symbol_short!("services"), symbol_short!("config")), record);
     }
 
-    pub fn get_supported_services(env: Env, anchor: Address) -> AnchorServices {
+    /// The service-capability schema version this contract understands.
+    /// Off-chain capability discovery can read this to learn which service
+    /// codes the contract will accept.
+    pub fn current_capability_version(_env: Env) -> u32 {
+        SERVICE_CAPABILITY_VERSION
+    }
+
+    /// Return the capability version an anchor's stored service set was
+    /// configured under. Panics with `ServicesNotConfigured` if absent.
+    pub fn get_service_capability_version(env: Env, anchor: Address) -> u32 {
         env.storage()
             .persistent()
             .get::<_, AnchorServices>(&(symbol_short!("SERVICES"), anchor))
+            .map(|r| r.service_capability_version)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ServicesNotConfigured))
+    }
+
+    pub fn get_supported_services(env: Env, anchor: Address) -> AnchorServices {
+        let xdr = anchor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        env.storage()
+            .persistent()
+            .get::<_, AnchorServices>(&make_storage_key(&env, &[b"SERVICES", &raw]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ServicesNotConfigured))
     }
 
     pub fn supports_service(env: Env, anchor: Address, service: u32) -> bool {
+        let xdr = anchor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         let record = env
             .storage()
             .persistent()
-            .get::<_, AnchorServices>(&(symbol_short!("SERVICES"), anchor))
+            .get::<_, AnchorServices>(&make_storage_key(&env, &[b"SERVICES", &raw]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ServicesNotConfigured));
         record.services.contains(&service)
     }
@@ -1136,37 +1354,27 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             panic_with_error!(&env, ErrorCode::RateLimitExceeded);
         }
 
-        let used_key = (symbol_short!("USED"), issuer.clone(), payload_hash.clone());
+        let issuer_xdr = issuer.clone().to_xdr(&env);
+        let issuer_raw = xdr_to_vec(&issuer_xdr);
+        let hash_raw = xdr_to_vec(&payload_hash);
+        let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env,
-            id,
-            issuer.clone(),
-            subject.clone(),
-            timestamp,
-            payload_hash.clone(),
-            signature,
+            &env, id, issuer.clone(), subject.clone(), timestamp,
+            payload_hash.clone(), signature,
         );
 
         env.storage().persistent().set(&used_key, &timestamp);
-        env.storage()
-            .persistent()
-            .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
+        env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
         env.events().publish(
-            (
-                symbol_short!("attest"),
-                symbol_short!("recorded"),
-                id,
-                subject,
-            ),
+            (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
             AttestEvent { payload_hash, timestamp },
         );
-
         id
     }
 
@@ -1188,63 +1396,48 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
         Self::check_timestamp(&env, timestamp);
 
-        // Check KYC if required
         if require_kyc {
             let kyc_status = Self::get_kyc_status(env.clone(), subject.clone());
-            
-            // Only Approved status allows attestation
             if kyc_status != KycStatus::Approved {
                 match kyc_status {
-                    KycStatus::Pending => panic_with_error!(&env, ErrorCode::KycPending),
-                    KycStatus::Rejected => panic_with_error!(&env, ErrorCode::KycRejected),
-                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::Pending    => panic_with_error!(&env, ErrorCode::KycPending),
+                    KycStatus::Rejected   => panic_with_error!(&env, ErrorCode::KycRejected),
+                    KycStatus::Expired    => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                     KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
                     _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                 }
             }
         }
 
-        let used_key = (symbol_short!("USED"), issuer.clone(), payload_hash.clone());
+        let issuer_xdr = issuer.clone().to_xdr(&env);
+        let issuer_raw = xdr_to_vec(&issuer_xdr);
+        let hash_raw = xdr_to_vec(&payload_hash);
+        let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env,
-            id,
-            issuer.clone(),
-            subject.clone(),
-            timestamp,
-            payload_hash.clone(),
-            signature,
+            &env, id, issuer.clone(), subject.clone(), timestamp,
+            payload_hash.clone(), signature,
         );
 
         env.storage().persistent().set(&used_key, &timestamp);
-        env.storage()
-            .persistent()
-            .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
+        env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
+        let now = env.ledger().timestamp();
         env.events().publish(
-            (
-                symbol_short!("attest"),
-                symbol_short!("recorded"),
-                id,
-                subject,
-            ),
+            (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
             AttestEvent { payload_hash: payload_hash.clone(), timestamp },
         );
-
         env.events().publish(
             (symbol_short!("webhook"), symbol_short!("event")),
             WebhookEvent {
                 event_type: String::from_str(&env, "attestation_submitted"),
-                transaction_id: id,
-                timestamp,
-                payload_hash,
+                transaction_id: id, timestamp, payload_hash,
             },
         );
-
         id
     }
 
@@ -1267,34 +1460,28 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
-        let used_key = (symbol_short!("USED"), issuer.clone(), payload_hash.clone());
+        let issuer_xdr = issuer.clone().to_xdr(&env);
+        let issuer_raw = xdr_to_vec(&issuer_xdr);
+        let hash_raw = xdr_to_vec(&payload_hash);
+        let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env,
-            id,
-            issuer.clone(),
-            subject.clone(),
-            timestamp,
-            payload_hash.clone(),
-            signature,
+            &env, id, issuer.clone(), subject.clone(), timestamp,
+            payload_hash.clone(), signature,
         );
 
         env.storage().persistent().set(&used_key, &timestamp);
-        env.storage()
-            .persistent()
-            .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
+        env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
         let now = env.ledger().timestamp();
         Self::store_span(
-            &env,
-            &request_id,
+            &env, &request_id,
             String::from_str(&env, "submit_attestation"),
-            issuer.clone(),
-            now,
+            issuer.clone(), now,
             String::from_str(&env, "success"),
         );
 
@@ -1302,25 +1489,16 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         Self::record_operation_in_context(&env, &request_id.id, String::from_str(&env, "submit_attestation"));
 
         env.events().publish(
-            (
-                symbol_short!("attest"),
-                symbol_short!("recorded"),
-                id,
-                subject,
-            ),
+            (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
             AttestEvent { payload_hash: payload_hash.clone(), timestamp },
         );
-
         env.events().publish(
             (symbol_short!("webhook"), symbol_short!("event")),
             WebhookEvent {
                 event_type: String::from_str(&env, "attestation_submitted"),
-                transaction_id: id,
-                timestamp,
-                payload_hash,
+                transaction_id: id, timestamp, payload_hash,
             },
         );
-
         id
     }
 
@@ -1342,23 +1520,21 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         expires_at: u64,
     ) {
         anchor.require_auth();
-
+        let xdr = anchor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         let services_record = env
             .storage()
             .persistent()
-            .get::<_, AnchorServices>(&(symbol_short!("SERVICES"), anchor.clone()))
+            .get::<_, AnchorServices>(&make_storage_key(&env, &[b"SERVICES", &raw]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ServicesNotConfigured));
         if !services_record.services.contains(&SERVICE_QUOTES) {
             panic_with_error!(&env, ErrorCode::ServicesNotConfigured);
         }
-
         let now = env.ledger().timestamp();
         Self::store_span(
-            &env,
-            &request_id,
+            &env, &request_id,
             String::from_str(&env, "submit_quote"),
-            anchor,
-            now,
+            anchor, now,
             String::from_str(&env, "success"),
         );
 
@@ -1381,6 +1557,11 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     ///
     /// The TracingContext for the root must have been initialised by a prior
     /// `submit_with_request_id` call (which stores span_index = 0).
+    ///
+    /// Panics with `ValidationError` if:
+    /// - the parent span does not exist (no root context found)
+    /// - `child_request_id` bytes are identical to `parent_request_id` bytes
+    /// - the child span index would not increment correctly
     pub fn propagate_span(
         env: Env,
         parent_request_id: RequestId,
@@ -1389,21 +1570,25 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         actor: Address,
     ) {
         actor.require_auth();
-        let now = env.ledger().timestamp();
 
-        // Load or create the TracingContext for this root trace
+        // Validate: child must differ from parent
+        if child_request_id.id == parent_request_id.id {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
+        // Validate: a root context must exist for the parent (i.e. the parent
+        // span was created by submit_with_request_id or a prior propagate_span).
         let ctx_key = (symbol_short!("TRACECTX"), parent_request_id.id.clone());
         let mut ctx: TracingContext = env
             .storage()
             .temporary()
             .get(&ctx_key)
-            .unwrap_or(TracingContext {
-                root_request_id_bytes: parent_request_id.id.clone(),
-                next_span_index: 1,
-            });
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ValidationError));
 
         let span_index = ctx.next_span_index;
         ctx.next_span_index += 1;
+
+        let now = env.ledger().timestamp();
         env.storage().temporary().set(&ctx_key, &ctx);
         env.storage().temporary().extend_ttl(&ctx_key, SPAN_TTL, SPAN_TTL);
 
@@ -1469,10 +1654,12 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
 
     /// Create a new `RequestContext` for a root request ID.
     ///
-    /// Stores the context in temporary storage keyed by the root request ID bytes
-    /// and returns it. The `operation_chain` starts empty; call
-    /// `append_operation` to record each sub-operation.
+    /// Panics with `ValidationError` if `root_request_id.id` is empty.
     pub fn create_request_context(env: Env, root_request_id: RequestId) -> RequestContext {
+        if root_request_id.id.is_empty() {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        Self::require_valid_timestamp(&env, root_request_id.created_at);
         let now = env.ledger().timestamp();
         let ctx = RequestContext {
             root_request_id: root_request_id.clone(),
@@ -1489,11 +1676,14 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
 
     /// Append `operation_name` to the `operation_chain` of the context identified
     /// by `root_request_id_bytes`. Creates the context if it does not yet exist.
+    ///
+    /// Panics with `ValidationError` if `operation_name` is empty.
     pub fn append_operation(
         env: Env,
         root_request_id_bytes: Bytes,
         operation_name: String,
     ) {
+        Self::require_non_empty_string(&env, &operation_name);
         let key = (symbol_short!("REQCTX"), root_request_id_bytes.clone());
         let mut ctx: RequestContext = env
             .storage()
@@ -1533,14 +1723,15 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     pub fn get_attestation(env: Env, id: u64) -> Attestation {
         env.storage()
             .persistent()
-            .get::<_, Attestation>(&(symbol_short!("ATTEST"), id))
+            .get::<_, Attestation>(&make_storage_key(&env, &[b"ATTEST", &id.to_be_bytes()]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound))
     }
 
-    /// Returns the original submission timestamp for a given (issuer, payload_hash) pair,
-    /// or panics with `AttestationNotFound` if no such attestation has been submitted.
     pub fn get_attestation_by_hash(env: Env, issuer: Address, payload_hash: Bytes) -> u64 {
-        let used_key = (symbol_short!("USED"), issuer, payload_hash);
+        let issuer_xdr = issuer.clone().to_xdr(&env);
+        let issuer_raw = xdr_to_vec(&issuer_xdr);
+        let hash_raw = xdr_to_vec(&payload_hash);
+        let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         env.storage()
             .persistent()
             .get::<_, u64>(&used_key)
@@ -1567,13 +1758,11 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         let attestation = env
             .storage()
             .persistent()
-            .get::<_, Attestation>(&(symbol_short!("ATTEST"), attestation_id))
+            .get::<_, Attestation>(&make_storage_key(&env, &[b"ATTEST", &attestation_id.to_be_bytes()]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
 
-        // Convert stored Bytes payload_hash to BytesN<32>
-        let stored: BytesN<32> = attestation.payload_hash.try_into().unwrap_or_else(|_| {
-            panic_with_error!(&env, ErrorCode::ValidationError)
-        });
+        let stored: BytesN<32> = attestation.payload_hash.try_into()
+            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::ValidationError));
         verify_payload_hash(&stored, &expected_hash)
     }
 
@@ -1585,150 +1774,91 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     // KYC data management
     // -----------------------------------------------------------------------
 
-    /// Submit KYC data for a subject. Stores SHA-256 hash of KYC payload.
-    /// Never stores raw PII, only the hash. Creates a KycRecord with Pending status.
-    /// Requires attestor authorization.
-    pub fn submit_kyc(
-        env: Env,
-        subject: Address,
-        data_hash: Bytes,
-        attestor: Address,
-    ) {
+    pub fn submit_kyc(env: Env, subject: Address, data_hash: Bytes, attestor: Address) {
         attestor.require_auth();
         Self::check_attestor(&env, &attestor);
-
         let now = env.ledger().timestamp();
-        let key = kyc_record_key(&subject);
-
-        // Check if KYC already submitted
+        let key = kyc_record_key(&env, &subject);
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, ErrorCode::ComplianceNotMet);
         }
-
-        // Create new KYC record with Pending status
         let record = KycRecord {
-            subject: subject.clone(),
-            status: KycStatus::Pending as u32,
-            submitted_at: now,
-            reviewed_at: None,
-            expiry: None,
+            subject: subject.clone(), status: KycStatus::Pending as u32,
+            submitted_at: now, reviewed_at: None, expiry: None,
             rejection_reason_hash: None,
             schema_version: SCHEMA_V1,
         };
-
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
-
-        // Store the data hash separately for reference
-        let data_key = (symbol_short!("KYCDATA"), subject.clone());
+        let data_key = make_storage_key(&env, &[b"KYCDATA", &xdr_to_vec(&subject.clone().to_xdr(&env))]);
         env.storage().persistent().set(&data_key, &data_hash);
         env.storage().persistent().extend_ttl(&data_key, PERSISTENT_TTL, PERSISTENT_TTL);
-
         env.events().publish(
             (symbol_short!("kyc"), symbol_short!("submitted"), subject),
             WebhookEvent {
                 event_type: String::from_str(&env, "kyc_submitted"),
-                transaction_id: 0,
-                timestamp: now,
-                payload_hash: data_hash,
+                transaction_id: 0, timestamp: now, payload_hash: data_hash,
             },
         );
     }
 
-    /// Approve KYC for a subject. Requires admin authorization.
-    /// Transitions status from Pending to Approved and sets reviewed_at timestamp.
     pub fn approve_kyc(env: Env, subject: Address) {
         Self::require_admin(&env);
         let now = env.ledger().timestamp();
-        let key = kyc_record_key(&subject);
-
-        let mut record: KycRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
+        let key = kyc_record_key(&env, &subject);
+        let mut record: KycRecord = env.storage().persistent().get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
-
-        // Only allow approval from Pending state
         if record.status != KycStatus::Pending as u32 {
             panic_with_error!(&env, ErrorCode::IllegalTransition);
         }
-
         record.status = KycStatus::Approved as u32;
         record.reviewed_at = Some(now);
-
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
-
         env.events().publish(
             (symbol_short!("kyc"), symbol_short!("approved"), subject),
             WebhookEvent {
                 event_type: String::from_str(&env, "kyc_approved"),
-                transaction_id: 0,
-                timestamp: now,
-                payload_hash: Bytes::new(&env),
+                transaction_id: 0, timestamp: now, payload_hash: Bytes::new(&env),
             },
         );
     }
 
-    /// Reject KYC for a subject. Requires admin authorization.
-    /// Transitions status from Pending to Rejected and stores rejection reason hash.
     pub fn reject_kyc(env: Env, subject: Address, reason_hash: Bytes) {
         Self::require_admin(&env);
         let now = env.ledger().timestamp();
-        let key = kyc_record_key(&subject);
-
-        let mut record: KycRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
+        let key = kyc_record_key(&env, &subject);
+        let mut record: KycRecord = env.storage().persistent().get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
-
-        // Only allow rejection from Pending state
         if record.status != KycStatus::Pending as u32 {
             panic_with_error!(&env, ErrorCode::IllegalTransition);
         }
-
         record.status = KycStatus::Rejected as u32;
         record.reviewed_at = Some(now);
         record.rejection_reason_hash = Some(reason_hash.clone());
-
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
-
         env.events().publish(
             (symbol_short!("kyc"), symbol_short!("rejected"), subject),
             WebhookEvent {
                 event_type: String::from_str(&env, "kyc_rejected"),
-                transaction_id: 0,
-                timestamp: now,
-                payload_hash: reason_hash,
+                transaction_id: 0, timestamp: now, payload_hash: reason_hash,
             },
         );
     }
 
-    /// Get the KYC status for a subject.
-    /// Returns KycStatus enum value. Returns NotSubmitted if no record exists.
     pub fn get_kyc_status(env: Env, subject: Address) -> KycStatus {
-        let key = kyc_record_key(&subject);
-
-        // Return NotSubmitted if no KYC record exists
+        let key = kyc_record_key(&env, &subject);
         if !env.storage().persistent().has(&key) {
             return KycStatus::NotSubmitted;
         }
-
-        let record: KycRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
+        let record: KycRecord = env.storage().persistent().get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
-
-        // Check if KYC has expired
         if let Some(expiry) = record.expiry {
             if env.ledger().timestamp() > expiry {
                 return KycStatus::Expired;
             }
         }
-
         match record.status {
             0 => KycStatus::NotSubmitted,
             1 => KycStatus::Pending,
@@ -1759,7 +1889,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             result: if passed { 1u32 } else { 0u32 },
             timestamp: now,
         };
-        let key = compliance_check_key(&subject, &check_type);
+        let key = compliance_check_key(&env, &subject, &check_type);
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
         env.events().publish(
@@ -1768,10 +1898,28 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Input validation helpers (#243)
+    // -----------------------------------------------------------------------
+
+    /// Panic with `ValidationError` if `s` is empty.
+    fn require_non_empty_string(env: &Env, s: &String) {
+        if s.len() == 0 {
+            panic_with_error!(env, ErrorCode::ValidationError);
+        }
+    }
+
+    /// Panic with `InvalidTimestamp` if `ts` is zero.
+    fn require_valid_timestamp(env: &Env, ts: u64) {
+        if ts == 0 {
+            panic_with_error!(env, ErrorCode::InvalidTimestamp);
+        }
+    }
+
     pub fn create_session(env: Env, initiator: Address) -> u64 {
         initiator.require_auth();
         let inst = env.storage().instance();
-        let scnt_key = soroban_sdk::vec![&env, symbol_short!("SCNT")];
+        let scnt_key = make_storage_key(&env, &[b"SCNT"]);
         let session_id: u64 = inst.get(&scnt_key).unwrap_or(0u64);
         inst.set(&scnt_key, &(session_id + 1));
         inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
@@ -1786,11 +1934,11 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             session_ttl_seconds: DEFAULT_SESSION_TTL,
             closed: false,
         };
-        let sess_key = (symbol_short!("SESS"), session_id);
+        let sess_key = make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]);
         env.storage().persistent().set(&sess_key, &session);
         env.storage().persistent().extend_ttl(&sess_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        let snonce_key = (symbol_short!("SNONCE"), session_id);
+        let snonce_key = make_storage_key(&env, &[b"SNONCE", &session_id.to_be_bytes()]);
         env.storage().persistent().set(&snonce_key, &0u64);
         env.storage().persistent().extend_ttl(&snonce_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
@@ -1798,13 +1946,12 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             (symbol_short!("session"), symbol_short!("created"), session_id),
             SessionCreatedEvent { session_id, initiator, timestamp: now },
         );
-
         session_id
     }
 
     pub fn close_session(env: Env, session_id: u64, initiator: Address) {
         initiator.require_auth();
-        let sess_key = (symbol_short!("SESS"), session_id);
+        let sess_key = make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]);
         let mut session: Session = env
             .storage()
             .persistent()
@@ -1821,13 +1968,22 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     }
 
     fn require_session_open(env: &Env, session_id: u64) {
-        let sess_key = (symbol_short!("SESS"), session_id);
+        let sess_key = make_storage_key(env, &[b"SESS", &session_id.to_be_bytes()]);
         let session: Session = env
             .storage()
             .persistent()
             .get(&sess_key)
             .unwrap_or_else(|| panic_with_error!(env, ErrorCode::AttestationNotFound));
         Self::validate_session(env, &session);
+        // #232: enforce per-session operation limit
+        let op_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&make_storage_key(env, &[b"SOPCNT", &session_id.to_be_bytes()]))
+            .unwrap_or(0u64);
+        if op_count >= MAX_OPS_PER_SESSION {
+            panic_with_error!(env, ErrorCode::SessionOperationLimitExceeded);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1849,61 +2005,44 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         validate_fee_percent(&env, fee_percentage);
         validate_amount_limits(&env, minimum_amount, maximum_amount);
         let inst = env.storage().instance();
-        let qcnt_key = soroban_sdk::vec![&env, symbol_short!("QCNT")];
+        let qcnt_key = make_storage_key(&env, &[b"QCNT"]);
         let next: u64 = inst.get(&qcnt_key).unwrap_or(0u64) + 1;
         inst.set(&qcnt_key, &next);
         inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
 
+        let anchor_xdr = anchor.clone().to_xdr(&env);
+        let anchor_raw = xdr_to_vec(&anchor_xdr);
         let quote = Quote {
-            quote_id: next,
-            anchor: anchor.clone(),
-            base_asset: base_asset.clone(),
-            quote_asset: quote_asset.clone(),
-            rate,
-            fee_percentage,
-            minimum_amount,
-            maximum_amount,
-            valid_until,
-            schema_version: SCHEMA_V1,
+            quote_id: next, anchor: anchor.clone(),
+            base_asset: base_asset.clone(), quote_asset: quote_asset.clone(),
+            rate, fee_percentage, minimum_amount, maximum_amount, valid_until,
         };
-        let q_key = (symbol_short!("QUOTE"), anchor.clone(), next);
+        let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &next.to_be_bytes()]);
         env.storage().persistent().set(&q_key, &quote);
         env.storage().persistent().extend_ttl(&q_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        let lq_key = (symbol_short!("LATESTQ"), anchor.clone());
+        let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
         env.storage().persistent().set(&lq_key, &next);
         env.storage().persistent().extend_ttl(&lq_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
         env.events().publish(
             (symbol_short!("quote"), symbol_short!("submit"), next),
-            QuoteSubmitEvent {
-                quote_id: next,
-                anchor,
-                base_asset,
-                quote_asset,
-                rate,
-                valid_until,
-            },
+            QuoteSubmitEvent { quote_id: next, anchor, base_asset, quote_asset, rate, valid_until },
         );
-
         next
     }
 
     pub fn receive_quote(env: Env, receiver: Address, anchor: Address, quote_id: u64) -> Quote {
         receiver.require_auth();
-        let q_key = (symbol_short!("QUOTE"), anchor.clone(), quote_id);
+        let anchor_xdr = anchor.clone().to_xdr(&env);
+        let anchor_raw = xdr_to_vec(&anchor_xdr);
+        let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         let quote: Quote = env.storage().persistent().get(&q_key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
-
         env.events().publish(
             (symbol_short!("quote"), symbol_short!("received"), quote_id),
-            QuoteReceivedEvent {
-                quote_id,
-                receiver,
-                timestamp: env.ledger().timestamp(),
-            },
+            QuoteReceivedEvent { quote_id, receiver, timestamp: env.ledger().timestamp() },
         );
-
         quote
     }
 
@@ -1927,114 +2066,107 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
-        let used_key = (symbol_short!("USED"), issuer.clone(), payload_hash.clone());
+        // #232: per-session request-ID replay protection
+        let hash_raw = xdr_to_vec(&payload_hash);
+        let sess_req_key = make_storage_key(
+            &env, &[b"SESSREQ", &session_id.to_be_bytes(), &hash_raw],
+        );
+        if env.storage().persistent().has(&sess_req_key) {
+            panic_with_error!(&env, ErrorCode::ReplayAttack);
+        }
+        env.storage().persistent().set(&sess_req_key, &true);
+        env.storage().persistent().extend_ttl(&sess_req_key, REPLAY_TTL, REPLAY_TTL);
+
+        let issuer_xdr = issuer.clone().to_xdr(&env);
+        let issuer_raw = xdr_to_vec(&issuer_xdr);
+        let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env,
-            id,
-            issuer.clone(),
-            subject.clone(),
-            timestamp,
-            payload_hash.clone(),
-            signature,
+            &env, id, issuer.clone(), subject.clone(), timestamp,
+            payload_hash.clone(), signature,
         );
 
         env.storage().persistent().set(&used_key, &timestamp);
         env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
         // Increment session nonce
-        let sess_key = (symbol_short!("SESS"), session_id);
+        let sess_key = make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]);
         let mut session: Session = env
-            .storage()
-            .persistent()
-            .get(&sess_key)
+            .storage().persistent().get(&sess_key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
         session.nonce += 1;
         env.storage().persistent().set(&sess_key, &session);
         env.storage().persistent().extend_ttl(&sess_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        // Get and increment session operation count
-        let sopcnt_key = (symbol_short!("SOPCNT"), session_id);
+        let sopcnt_key = make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]);
         let op_index: u64 = env.storage().persistent().get(&sopcnt_key).unwrap_or(0u64);
         env.storage().persistent().set(&sopcnt_key, &(op_index + 1));
         env.storage().persistent().extend_ttl(&sopcnt_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        // Write audit log
         let inst = env.storage().instance();
-        let acnt_key = soroban_sdk::vec![&env, symbol_short!("ACNT")];
+        let acnt_key = make_storage_key(&env, &[b"ACNT"]);
         let log_id: u64 = inst.get(&acnt_key).unwrap_or(0u64);
         inst.set(&acnt_key, &(log_id + 1));
         inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
 
         let now = env.ledger().timestamp();
         let audit = AuditLog {
-            log_id,
-            session_id,
-            actor: issuer.clone(),
+            log_id, session_id, actor: issuer.clone(),
             operation: OperationContext {
-                session_id,
-                operation_index: op_index,
+                session_id, operation_index: op_index,
                 operation_type: String::from_str(&env, "attest"),
-                timestamp: now,
-                status: String::from_str(&env, "success"),
+                timestamp: now, status: String::from_str(&env, "success"),
                 result_data: id,
             },
         };
-        let audit_key = (symbol_short!("AUDIT"), log_id);
+        let audit_key = make_storage_key(&env, &[b"AUDIT", &log_id.to_be_bytes()]);
         env.storage().persistent().set(&audit_key, &audit);
         env.storage().persistent().extend_ttl(&audit_key, PERSISTENT_TTL, PERSISTENT_TTL);
-        let slog_key = (symbol_short!("SLOG"), session_id, op_index);
+        let slog_key = make_storage_key(&env, &[b"SLOG", &session_id.to_be_bytes(), &op_index.to_be_bytes()]);
         env.storage().persistent().set(&slog_key, &log_id);
         env.storage().persistent().extend_ttl(&slog_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
         env.events().publish(
-            (
-                symbol_short!("attest"),
-                symbol_short!("recorded"),
-                id,
-                subject,
-            ),
+            (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
             AttestEvent { payload_hash, timestamp },
         );
-
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("logged"), log_id),
             AuditLogEvent {
-                log_id,
-                session_id,
-                operation_index: op_index,
+                log_id, session_id, operation_index: op_index,
                 operation_type: String::from_str(&env, "attest"),
                 status: String::from_str(&env, "success"),
             },
         );
-
         id
     }
 
     pub fn register_attestor_with_session(env: Env, session_id: u64, attestor: Address, public_key: BytesN<32>) {
         Self::require_admin(&env);
         Self::require_session_open(&env, session_id);
-        let key = (symbol_short!("ATTESTOR"), attestor.clone());
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let key = make_storage_key(&env, &[b"ATTESTOR", &raw]);
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, ErrorCode::AttestorAlreadyRegistered);
         }
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
-        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
         env.storage().persistent().set(&pk_key, &public_key);
         env.storage().persistent().extend_ttl(&pk_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        let sopcnt_key = (symbol_short!("SOPCNT"), session_id);
+        let sopcnt_key = make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]);
         let op_index: u64 = env.storage().persistent().get(&sopcnt_key).unwrap_or(0u64);
         env.storage().persistent().set(&sopcnt_key, &(op_index + 1));
         env.storage().persistent().extend_ttl(&sopcnt_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
         let inst = env.storage().instance();
-        let acnt_key = soroban_sdk::vec![&env, symbol_short!("ACNT")];
+        let acnt_key = make_storage_key(&env, &[b"ACNT"]);
         let log_id: u64 = inst.get(&acnt_key).unwrap_or(0u64);
         inst.set(&acnt_key, &(log_id + 1));
         inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
@@ -2044,35 +2176,26 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::NotInitialized));
         let now = env.ledger().timestamp();
         let audit = AuditLog {
-            log_id,
-            session_id,
-            actor: admin,
+            log_id, session_id, actor: admin,
             operation: OperationContext {
-                session_id,
-                operation_index: op_index,
+                session_id, operation_index: op_index,
                 operation_type: String::from_str(&env, "register"),
-                timestamp: now,
-                status: String::from_str(&env, "success"),
+                timestamp: now, status: String::from_str(&env, "success"),
                 result_data: 0,
             },
         };
-        let audit_key = (symbol_short!("AUDIT"), log_id);
+        let audit_key = make_storage_key(&env, &[b"AUDIT", &log_id.to_be_bytes()]);
         env.storage().persistent().set(&audit_key, &audit);
         env.storage().persistent().extend_ttl(&audit_key, PERSISTENT_TTL, PERSISTENT_TTL);
-        let slog_key = (symbol_short!("SLOG"), session_id, op_index);
+        let slog_key = make_storage_key(&env, &[b"SLOG", &session_id.to_be_bytes(), &op_index.to_be_bytes()]);
         env.storage().persistent().set(&slog_key, &log_id);
         env.storage().persistent().extend_ttl(&slog_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("added"), attestor),
-            (),
-        );
+        env.events().publish((symbol_short!("attestor"), symbol_short!("added"), attestor), ());
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("logged"), log_id),
             AuditLogEvent {
-                log_id,
-                session_id,
-                operation_index: op_index,
+                log_id, session_id, operation_index: op_index,
                 operation_type: String::from_str(&env, "register"),
                 status: String::from_str(&env, "success"),
             },
@@ -2082,21 +2205,23 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     pub fn revoke_attestor_with_session(env: Env, session_id: u64, attestor: Address) {
         Self::require_admin(&env);
         Self::require_session_open(&env, session_id);
-        let key = (symbol_short!("ATTESTOR"), attestor.clone());
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let key = make_storage_key(&env, &[b"ATTESTOR", &raw]);
         if !env.storage().persistent().has(&key) {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
         env.storage().persistent().remove(&key);
-        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
         env.storage().persistent().remove(&pk_key);
 
-        let sopcnt_key = (symbol_short!("SOPCNT"), session_id);
+        let sopcnt_key = make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]);
         let op_index: u64 = env.storage().persistent().get(&sopcnt_key).unwrap_or(0u64);
         env.storage().persistent().set(&sopcnt_key, &(op_index + 1));
         env.storage().persistent().extend_ttl(&sopcnt_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
         let inst = env.storage().instance();
-        let acnt_key = soroban_sdk::vec![&env, symbol_short!("ACNT")];
+        let acnt_key = make_storage_key(&env, &[b"ACNT"]);
         let log_id: u64 = inst.get(&acnt_key).unwrap_or(0u64);
         inst.set(&acnt_key, &(log_id + 1));
         inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
@@ -2106,35 +2231,26 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::NotInitialized));
         let now = env.ledger().timestamp();
         let audit = AuditLog {
-            log_id,
-            session_id,
-            actor: admin,
+            log_id, session_id, actor: admin,
             operation: OperationContext {
-                session_id,
-                operation_index: op_index,
+                session_id, operation_index: op_index,
                 operation_type: String::from_str(&env, "revoke"),
-                timestamp: now,
-                status: String::from_str(&env, "success"),
+                timestamp: now, status: String::from_str(&env, "success"),
                 result_data: 0,
             },
         };
-        let audit_key = (symbol_short!("AUDIT"), log_id);
+        let audit_key = make_storage_key(&env, &[b"AUDIT", &log_id.to_be_bytes()]);
         env.storage().persistent().set(&audit_key, &audit);
         env.storage().persistent().extend_ttl(&audit_key, PERSISTENT_TTL, PERSISTENT_TTL);
-        let slog_key = (symbol_short!("SLOG"), session_id, op_index);
+        let slog_key = make_storage_key(&env, &[b"SLOG", &session_id.to_be_bytes(), &op_index.to_be_bytes()]);
         env.storage().persistent().set(&slog_key, &log_id);
         env.storage().persistent().extend_ttl(&slog_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("removed"), attestor),
-            (),
-        );
+        env.events().publish((symbol_short!("attestor"), symbol_short!("removed"), attestor), ());
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("logged"), log_id),
             AuditLogEvent {
-                log_id,
-                session_id,
-                operation_index: op_index,
+                log_id, session_id, operation_index: op_index,
                 operation_type: String::from_str(&env, "revoke"),
                 status: String::from_str(&env, "success"),
             },
@@ -2144,14 +2260,14 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     pub fn get_session(env: Env, session_id: u64) -> Session {
         env.storage()
             .persistent()
-            .get::<_, Session>(&(symbol_short!("SESS"), session_id))
+            .get::<_, Session>(&make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound))
     }
 
     pub fn get_audit_log(env: Env, log_id: u64) -> AuditLog {
         env.storage()
             .persistent()
-            .get::<_, AuditLog>(&(symbol_short!("AUDIT"), log_id))
+            .get::<_, AuditLog>(&make_storage_key(&env, &[b"AUDIT", &log_id.to_be_bytes()]))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound))
     }
 
@@ -2159,14 +2275,14 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         let total: u64 = env
             .storage()
             .persistent()
-            .get(&(symbol_short!("SOPCNT"), session_id))
+            .get(&make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]))
             .unwrap_or(0u64);
         let mut results = Vec::new(&env);
         let start = if total > limit { total - limit } else { 0 };
         for i in start..total {
-            let slog_key = (symbol_short!("SLOG"), session_id, i);
+            let slog_key = make_storage_key(&env, &[b"SLOG", &session_id.to_be_bytes(), &i.to_be_bytes()]);
             if let Some(log_id) = env.storage().persistent().get::<_, u64>(&slog_key) {
-                let audit_key = (symbol_short!("AUDIT"), log_id);
+                let audit_key = make_storage_key(&env, &[b"AUDIT", &log_id.to_be_bytes()]);
                 if let Some(entry) = env.storage().persistent().get::<_, AuditLog>(&audit_key) {
                     results.push_back(entry);
                 }
@@ -2178,7 +2294,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     pub fn get_session_operation_count(env: Env, session_id: u64) -> u64 {
         env.storage()
             .persistent()
-            .get::<_, u64>(&(symbol_short!("SOPCNT"), session_id))
+            .get::<_, u64>(&make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]))
             .unwrap_or(0)
     }
 
@@ -2304,6 +2420,88 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
     }
 
+    /// Report the SWR lifecycle state of an anchor's metadata cache entry
+    /// without panicking. This makes both fresh and stale availability explicit:
+    /// callers can distinguish `Fresh`, `Stale` (serve-but-refresh), `Expired`
+    /// (do not serve), and `Missing` rather than relying on a thrown error.
+    ///
+    /// Unlike [`get_cached_metadata_swr`](Self::get_cached_metadata_swr) this is a
+    /// pure read — it never mutates the stored `needs_refresh` flag.
+    pub fn get_metadata_cache_state(env: Env, anchor: Address) -> MetadataCacheState {
+        let key = (symbol_short!("METACACHE"), anchor);
+        let entry: MetadataCache = match env.storage().temporary().get(&key) {
+            Some(e) => e,
+            None => return MetadataCacheState::Missing,
+        };
+        let now = env.ledger().timestamp();
+        let age = now.saturating_sub(entry.cached_at);
+        if age <= entry.ttl_seconds {
+            MetadataCacheState::Fresh
+        } else if age <= entry.ttl_seconds.saturating_add(entry.stale_ttl_seconds) {
+            MetadataCacheState::Stale
+        } else {
+            MetadataCacheState::Expired
+        }
+    }
+
+    /// Complete an in-flight stale-while-revalidate refresh with freshly-fetched
+    /// metadata, preserving the last-known-good entry until the new data is
+    /// validated.
+    ///
+    /// Refresh semantics (issue #236):
+    /// - **Last-known-good preservation** — incoming metadata is validated
+    ///   *before* any storage write (see [`validate_metadata`]). If validation
+    ///   fails the call panics and the previously cached entry is left
+    ///   untouched, so a failed refresh never drops a usable cache entry.
+    /// - **Idempotent** — if the supplied metadata is byte-for-byte identical to
+    ///   the currently cached metadata *and* the entry is still `Fresh`, the call
+    ///   is a no-op: the `cached_at` clock is not reset, so repeated refreshes
+    ///   with unchanged data are stable. A refresh of a `Stale`/`Expired` entry
+    ///   (or with changed data) always rewrites and resets both TTL clocks.
+    ///
+    /// This is the SWR-aware counterpart to the destructive
+    /// [`refresh_metadata_cache`](Self::refresh_metadata_cache), which only
+    /// invalidates. Prefer this when you have replacement data in hand.
+    pub fn refresh_metadata_cache_swr(
+        env: Env,
+        anchor: Address,
+        metadata: AnchorMetadata,
+        ttl_seconds: u64,
+        stale_ttl_seconds: u64,
+    ) {
+        Self::require_admin(&env);
+        // Validate before touching storage so last-known-good survives a bad refresh.
+        Self::validate_metadata(&env, &anchor, &metadata);
+
+        let key = (symbol_short!("METACACHE"), anchor.clone());
+        let now = env.ledger().timestamp();
+
+        if let Some(existing) = env
+            .storage()
+            .temporary()
+            .get::<_, MetadataCache>(&key)
+        {
+            let age = now.saturating_sub(existing.cached_at);
+            let still_fresh = age <= existing.ttl_seconds;
+            if still_fresh && existing.metadata == metadata {
+                // Idempotent no-op: nothing changed and the entry is still fresh.
+                return;
+            }
+        }
+
+        let entry = MetadataCache {
+            metadata,
+            cached_at: now,
+            ttl_seconds,
+            stale_ttl_seconds,
+            needs_refresh: false,
+        };
+        let total_ttl = ttl_seconds.saturating_add(stale_ttl_seconds);
+        let ledger_ttl = if total_ttl as u32 > MIN_TEMP_TTL { total_ttl as u32 } else { MIN_TEMP_TTL };
+        env.storage().temporary().set(&key, &entry);
+        env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
+    }
+
     // -----------------------------------------------------------------------
     // Capabilities cache
     // -----------------------------------------------------------------------
@@ -2342,7 +2540,9 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     // -----------------------------------------------------------------------
 
     pub fn get_quote(env: Env, anchor: Address, quote_id: u64) -> Quote {
-        let key = (symbol_short!("QUOTE"), anchor.clone(), quote_id);
+        let anchor_xdr = anchor.clone().to_xdr(&env);
+        let anchor_raw = xdr_to_vec(&anchor_xdr);
+        let key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         env.storage().persistent().get::<_, Quote>(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::NoQuotesAvailable))
     }
@@ -2366,12 +2566,12 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             total_volume,
             is_active: true,
         };
-        let meta_key = (symbol_short!("ANCHMETA"), anchor.clone());
+        let meta_key = anchor_meta_key(&env, &anchor);
         env.storage().persistent().set(&meta_key, &meta);
         env.storage().persistent().extend_ttl(&meta_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        // Maintain ANCHLIST
-        let list_key = soroban_sdk::vec![&env, symbol_short!("ANCHLIST")];
+        // Maintain ANCHLIST — stored under a deterministic key (#229)
+        let list_key = make_storage_key(&env, &[b"ANCHLIST"]);
         let mut list: Vec<Address> = env.storage().persistent()
             .get::<_, Vec<Address>>(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
@@ -2385,7 +2585,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     /// Reactivate a previously deactivated anchor (admin-only). Sets `is_active = true`.
     pub fn reactivate_anchor(env: Env, anchor: Address) {
         Self::require_admin(&env);
-        let meta_key = (symbol_short!("ANCHMETA"), anchor.clone());
+        let meta_key = anchor_meta_key(&env, &anchor);
         let mut meta: RoutingAnchorMeta = env
             .storage()
             .persistent()
@@ -2402,13 +2602,13 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     pub fn get_anchor_metadata(env: Env, anchor: Address) -> RoutingAnchorMeta {
         env.storage()
             .persistent()
-            .get::<_, RoutingAnchorMeta>(&(symbol_short!("ANCHMETA"), anchor))
+            .get::<_, RoutingAnchorMeta>(&anchor_meta_key(&env, &anchor))
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered))
     }
 
     /// Return all anchors in ANCHLIST where `is_active == true`.
     pub fn list_active_anchors(env: Env) -> Vec<Address> {
-        let list_key = soroban_sdk::vec![&env, symbol_short!("ANCHLIST")];
+        let list_key = make_storage_key(&env, &[b"ANCHLIST"]);
         let anchors: Vec<Address> = env
             .storage()
             .persistent()
@@ -2416,11 +2616,10 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             .unwrap_or_else(|| Vec::new(&env));
         let mut active = Vec::new(&env);
         for anchor in anchors.iter() {
-            let meta_key = (symbol_short!("ANCHMETA"), anchor.clone());
             if let Some(meta) = env
                 .storage()
                 .persistent()
-                .get::<_, RoutingAnchorMeta>(&meta_key)
+                .get::<_, RoutingAnchorMeta>(&anchor_meta_key(&env, &anchor))
             {
                 if meta.is_active {
                     active.push_back(anchor);
@@ -2432,7 +2631,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
 
     pub fn route_transaction(env: Env, options: RoutingOptions) -> Quote {
         let now = env.ledger().timestamp();
-        let list_key = soroban_sdk::vec![&env, symbol_short!("ANCHLIST")];
+        let list_key = make_storage_key(&env, &[b"ANCHLIST"]);
         let anchors: Vec<Address> = env.storage().persistent()
             .get::<_, Vec<Address>>(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
@@ -2441,8 +2640,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         let mut candidates: Vec<Quote> = Vec::new(&env);
         for anchor in anchors.iter() {
             // Check reputation filter
-            let meta_key = (symbol_short!("ANCHMETA"), anchor.clone());
-            let meta: RoutingAnchorMeta = match env.storage().persistent().get(&meta_key) {
+            let meta: RoutingAnchorMeta = match env.storage().persistent().get(&anchor_meta_key(&env, &anchor)) {
                 Some(m) => m,
                 None => continue,
             };
@@ -2450,16 +2648,33 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             if meta.reputation_score < options.min_reputation { continue; }
 
             // Get latest quote for this anchor
-            let lq_key = (symbol_short!("LATESTQ"), anchor.clone());
+            let anchor_xdr = anchor.clone().to_xdr(&env);
+            let anchor_raw = xdr_to_vec(&anchor_xdr);
+            let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
             let quote_id: u64 = match env.storage().persistent().get(&lq_key) {
                 Some(id) => id,
                 None => continue,
             };
-            let q_key = (symbol_short!("QUOTE"), anchor.clone(), quote_id);
+            let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
             let quote: Quote = match env.storage().persistent().get(&q_key) {
                 Some(q) => q,
                 None => continue,
             };
+
+            // #238: the anchor must advertise the quote service. An anchor that
+            // never configured SERVICE_QUOTES is excluded before scoring even if
+            // a stale quote happens to be stored for it.
+            if !Self::advertises_quote_service(&env, &anchor) {
+                continue;
+            }
+
+            // #238: the quote must be for the requested asset pair. Quotes whose
+            // base/quote assets differ from the request are not a valid route.
+            if quote.base_asset != options.request.base_asset
+                || quote.quote_asset != options.request.quote_asset
+            {
+                continue;
+            }
 
             // Filter expired quotes
             if quote.valid_until <= now { continue; }
@@ -2482,7 +2697,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         if options.require_compliance {
             // Look for any passing compliance record for this subject
             // We check the generic "kyc" check_type as the standard compliance gate
-            let comp_key = compliance_check_key(&options.subject, &String::from_str(&env, "kyc"));
+            let comp_key = compliance_check_key(&env, &options.subject, &String::from_str(&env, "kyc"));
             let passed = env.storage().persistent()
                 .get::<_, ComplianceCheck>(&comp_key)
                 .map(|r| r.result == 1u32)
@@ -2500,7 +2715,10 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         let fastest_sym = Symbol::new(&env, "FastestSettlement");
         let reputation_sym = Symbol::new(&env, "HighestReputation");
 
-        let mut best: Quote = candidates.get(0).unwrap();
+        let mut best: Quote = match candidates.get(0) {
+            Some(q) => q,
+            None => panic_with_error!(&env, ErrorCode::NoQuotesAvailable),
+        };
 
         if strategy_sym == lowest_fee_sym {
             for q in candidates.iter() {
@@ -2510,15 +2728,11 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             }
         } else if strategy_sym == fastest_sym {
             // Need settlement time from metadata
-            let meta_key = (symbol_short!("ANCHMETA"), best.anchor.clone());
-            let mut best_time: u64 = env.storage().persistent()
-                .get::<_, RoutingAnchorMeta>(&meta_key)
+            let mut best_time: u64 = anchor_meta_opt(&env, &best.anchor)
                 .map(|m| m.average_settlement_time)
                 .unwrap_or(u64::MAX);
             for q in candidates.iter() {
-                let mk = (symbol_short!("ANCHMETA"), q.anchor.clone());
-                let t = env.storage().persistent()
-                    .get::<_, RoutingAnchorMeta>(&mk)
+                let t = anchor_meta_opt(&env, &q.anchor)
                     .map(|m| m.average_settlement_time)
                     .unwrap_or(u64::MAX);
                 if t < best_time {
@@ -2527,15 +2741,11 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
                 }
             }
         } else if strategy_sym == reputation_sym {
-            let meta_key = (symbol_short!("ANCHMETA"), best.anchor.clone());
-            let mut best_rep: u32 = env.storage().persistent()
-                .get::<_, RoutingAnchorMeta>(&meta_key)
+            let mut best_rep: u32 = anchor_meta_opt(&env, &best.anchor)
                 .map(|m| m.reputation_score)
                 .unwrap_or(0);
             for q in candidates.iter() {
-                let mk = (symbol_short!("ANCHMETA"), q.anchor.clone());
-                let rep = env.storage().persistent()
-                    .get::<_, RoutingAnchorMeta>(&mk)
+                let rep = anchor_meta_opt(&env, &q.anchor)
                     .map(|m| m.reputation_score)
                     .unwrap_or(0);
                 if rep > best_rep {
@@ -2545,8 +2755,6 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             }
         } else if strategy_sym == Symbol::new(&env, "WeightedScore") {
             // Issue #55: weighted score = reputation(40%) + liquidity(30%) + uptime(20%) - fee(10%)
-            // All component scores are u32 (0-100 range), fee_percentage is also u32.
-            // Score = reputation*40 + liquidity*30 + uptime*20 + (100 - fee_pct)*10
             let weighted_score = |meta: &RoutingAnchorMeta, fee_pct: u32| -> u64 {
                 let fee_factor = if fee_pct <= 100 { 100 - fee_pct } else { 0 };
                 (meta.reputation_score as u64) * 40
@@ -2554,15 +2762,11 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
                     + (meta.uptime_percentage as u64) * 20
                     + (fee_factor as u64) * 10
             };
-            let meta_key = (symbol_short!("ANCHMETA"), best.anchor.clone());
-            let mut best_score: u64 = env.storage().persistent()
-                .get::<_, RoutingAnchorMeta>(&meta_key)
+            let mut best_score: u64 = anchor_meta_opt(&env, &best.anchor)
                 .map(|m| weighted_score(&m, best.fee_percentage))
                 .unwrap_or(0);
             for q in candidates.iter() {
-                let mk = (symbol_short!("ANCHMETA"), q.anchor.clone());
-                let score = env.storage().persistent()
-                    .get::<_, RoutingAnchorMeta>(&mk)
+                let score = anchor_meta_opt(&env, &q.anchor)
                     .map(|m| weighted_score(&m, q.fee_percentage))
                     .unwrap_or(0);
                 if score > best_score {
@@ -2608,7 +2812,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         }
 
         let now = env.ledger().timestamp();
-        let list_key = soroban_sdk::vec![&env, symbol_short!("ANCHLIST")];
+        let list_key = make_storage_key(&env, &[b"ANCHLIST"]);
         let anchors: Vec<Address> = env.storage().persistent()
             .get::<_, Vec<Address>>(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
@@ -2623,12 +2827,14 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
                 Some(m) if m.is_active && m.reputation_score >= min_reputation => m,
                 _ => continue,
             };
-            let lq_key = (symbol_short!("LATESTQ"), anchor.clone());
+            let anchor_xdr = anchor.clone().to_xdr(&env);
+            let anchor_raw = xdr_to_vec(&anchor_xdr);
+            let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
             let quote_id: u64 = match env.storage().persistent().get(&lq_key) {
                 Some(id) => id,
                 None => continue,
             };
-            let q_key = (symbol_short!("QUOTE"), anchor.clone(), quote_id);
+            let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
             let quote: Quote = match env.storage().persistent().get(&q_key) {
                 Some(q) => q,
                 None => continue,
@@ -2647,12 +2853,14 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
                 Some(m) if m.is_active && m.reputation_score >= min_reputation => m,
                 _ => continue,
             };
-            let lq_key = (symbol_short!("LATESTQ"), anchor.clone());
+            let anchor_xdr = anchor.clone().to_xdr(&env);
+            let anchor_raw = xdr_to_vec(&anchor_xdr);
+            let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
             let quote_id: u64 = match env.storage().persistent().get(&lq_key) {
                 Some(id) => id,
                 None => continue,
             };
-            let q_key = (symbol_short!("QUOTE"), anchor.clone(), quote_id);
+            let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
             let quote: Quote = match env.storage().persistent().get(&q_key) {
                 Some(q) => q,
                 None => continue,
@@ -2882,11 +3090,46 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         admin.require_auth();
     }
 
+    /// Validate freshly-fetched anchor metadata before it is written to the
+    /// SWR cache. Panics with `ValidationError` on any problem so the caller's
+    /// last-known-good entry is preserved (no partial writes occur).
+    ///
+    /// Checks:
+    /// - the embedded `metadata.anchor` matches the key `anchor`
+    /// - `uptime_percentage` is within range (basis points, 0..=10000)
+    fn validate_metadata(env: &Env, anchor: &Address, metadata: &AnchorMetadata) {
+        if metadata.anchor != *anchor {
+            panic_with_error!(env, ErrorCode::ValidationError);
+        }
+        if metadata.uptime_percentage > 10_000 {
+            panic_with_error!(env, ErrorCode::ValidationError);
+        }
+    }
+
+    /// Returns `true` if `code` is a service identifier recognised by the
+    /// current [`SERVICE_CAPABILITY_VERSION`] (#239).
+    fn is_known_service_code(code: u32) -> bool {
+        code >= SERVICE_DEPOSITS && code <= MAX_KNOWN_SERVICE_CODE
+    }
+
+    /// Returns `true` iff `anchor` has configured services that include
+    /// `SERVICE_QUOTES`. Used by routing (#238) to exclude anchors that do not
+    /// advertise the quote service before scoring.
+    fn advertises_quote_service(env: &Env, anchor: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, AnchorServices>(&(symbol_short!("SERVICES"), anchor.clone()))
+            .map(|s| s.services.contains(&SERVICE_QUOTES))
+            .unwrap_or(false)
+    }
+
     fn check_attestor(env: &Env, attestor: &Address) {
+        let xdr = attestor.clone().to_xdr(env);
+        let raw = xdr_to_vec(&xdr);
         if !env
             .storage()
             .persistent()
-            .has(&(symbol_short!("ATTESTOR"), attestor.clone()))
+            .has(&make_storage_key(env, &[b"ATTESTOR", &raw]))
         {
             panic_with_error!(env, ErrorCode::AttestorNotRegistered);
         }
@@ -2903,10 +3146,12 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     }
 
     fn verify_attestation_signature(env: &Env, issuer: &Address, payload_hash: &Bytes, signature: &Bytes) {
+        let xdr = issuer.clone().to_xdr(env);
+        let raw = xdr_to_vec(&xdr);
         let pk: BytesN<32> = env
             .storage()
             .persistent()
-            .get(&(symbol_short!("ATPUBKEY"), issuer.clone()))
+            .get(&make_storage_key(env, &[b"ATPUBKEY", &raw]))
             .unwrap_or_else(|| panic_with_error!(env, ErrorCode::UnauthorizedAttestor));
         if signature.len() != 64 {
             panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
@@ -2942,20 +3187,10 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         payload_hash: Bytes,
         signature: Bytes,
     ) {
-        let attestation = Attestation {
-            id,
-            issuer,
-            subject,
-            timestamp,
-            payload_hash,
-            signature,
-            schema_version: SCHEMA_V1,
-        };
-        let key = (symbol_short!("ATTEST"), id);
+        let attestation = Attestation { id, issuer, subject, timestamp, payload_hash, signature };
+        let key = make_storage_key(env, &[b"ATTEST", &id.to_be_bytes()]);
         env.storage().persistent().set(&key, &attestation);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
     }
 
     fn store_span(

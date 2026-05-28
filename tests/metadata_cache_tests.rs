@@ -6,7 +6,9 @@ mod metadata_cache_tests {
         Address, Env, String,
     };
 
-    use crate::contract::{AnchorKitContract, AnchorKitContractClient, AnchorMetadata};
+    use anchorkit::contract::{
+        AnchorKitContract, AnchorKitContractClient, AnchorMetadata, MetadataCacheState,
+    };
 
     fn make_env() -> Env {
         let env = Env::default();
@@ -287,138 +289,176 @@ mod metadata_cache_tests {
     }
 
     // -----------------------------------------------------------------------
-    // #244 — CacheConfig-driven TTL tests
+    // Explicit cache-state query (#236)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_get_cache_config_returns_defaults_before_set() {
+    fn test_cache_state_missing() {
         let env = make_env();
-        set_ledger(&env, 0);
-        let contract_id = env.register_contract(None, AnchorKitContract);
-        let client = AnchorKitContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-
-        let cfg = client.get_cache_config();
-        // Default: 1 h metadata, 6 h capabilities, 5 min SWR
-        assert_eq!(cfg.metadata_ttl_seconds, 3_600);
-        assert_eq!(cfg.capabilities_ttl_seconds, 21_600);
-        assert_eq!(cfg.swr_ttl_seconds, 300);
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Missing);
     }
 
     #[test]
-    fn test_set_and_get_cache_config() {
+    fn test_cache_state_fresh_stale_expired_transitions() {
         let env = make_env();
-        set_ledger(&env, 0);
-        let contract_id = env.register_contract(None, AnchorKitContract);
-        let client = AnchorKitContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-
-        use crate::contract::CacheConfig;
-        let cfg = CacheConfig {
-            metadata_ttl_seconds: 7_200,
-            capabilities_ttl_seconds: 43_200,
-            swr_ttl_seconds: 600,
-        };
-        client.set_cache_config(&cfg);
-
-        let stored = client.get_cache_config();
-        assert_eq!(stored.metadata_ttl_seconds, 7_200);
-        assert_eq!(stored.capabilities_ttl_seconds, 43_200);
-        assert_eq!(stored.swr_ttl_seconds, 600);
-    }
-
-    /// Passing ttl_seconds = 0 to cache_metadata should use the configured default.
-    #[test]
-    fn test_cache_metadata_uses_configured_ttl_when_override_is_zero() {
-        let env = make_env();
-        set_ledger(&env, 0);
-        let contract_id = env.register_contract(None, AnchorKitContract);
-        let client = AnchorKitContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let anchor = Address::generate(&env);
-        client.initialize(&admin);
-
-        use crate::contract::CacheConfig;
-        // Set a short configured TTL so we can test expiry quickly
-        client.set_cache_config(&CacheConfig {
-            metadata_ttl_seconds: 50,
-            capabilities_ttl_seconds: 100,
-            swr_ttl_seconds: 10,
-        });
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
 
         let meta = sample_metadata(&env, &anchor);
-        // Pass 0 → should use configured 50 s
-        client.cache_metadata(&anchor, &meta, &0u64);
+        // primary TTL = 100s, stale TTL = 50s → total 150s
+        client.cache_metadata_swr(&anchor, &meta, &100u64, &50u64);
 
-        // Still fresh at t=49
-        set_ledger(&env, 49);
-        let retrieved = client.get_cached_metadata(&anchor);
-        assert_eq!(retrieved.reputation_score, 9000);
+        // Fresh within primary TTL
+        set_ledger(&env, 1050);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Fresh);
 
-        // Expired at t=51
-        set_ledger(&env, 51);
-        assert!(client.try_get_cached_metadata(&anchor).is_err());
+        // Stale within grace window
+        set_ledger(&env, 1120);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Stale);
+
+        // Expired beyond both TTLs
+        set_ledger(&env, 1160);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Expired);
     }
 
-    /// Passing a non-zero ttl_seconds overrides the configured default.
+    /// The state query is a pure read: it must not flip the persisted
+    /// `needs_refresh` flag the way `get_cached_metadata_swr` does.
     #[test]
-    fn test_cache_metadata_explicit_override_takes_precedence() {
+    fn test_cache_state_query_is_pure() {
         let env = make_env();
-        set_ledger(&env, 0);
-        let contract_id = env.register_contract(None, AnchorKitContract);
-        let client = AnchorKitContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let anchor = Address::generate(&env);
-        client.initialize(&admin);
-
-        use crate::contract::CacheConfig;
-        client.set_cache_config(&CacheConfig {
-            metadata_ttl_seconds: 50,
-            capabilities_ttl_seconds: 100,
-            swr_ttl_seconds: 10,
-        });
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
 
         let meta = sample_metadata(&env, &anchor);
-        // Explicit override of 200 s — should NOT expire at t=51
-        client.cache_metadata(&anchor, &meta, &200u64);
+        client.cache_metadata_swr(&anchor, &meta, &100u64, &50u64);
 
-        set_ledger(&env, 51);
-        let retrieved = client.get_cached_metadata(&anchor);
-        assert_eq!(retrieved.reputation_score, 9000);
+        // Move into the stale window and only query state (never call the SWR getter).
+        set_ledger(&env, 1120);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Stale);
+        // Querying again still reports Stale (no mutation occurred).
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Stale);
     }
 
-    /// cache_capabilities with ttl_seconds = 0 uses configured capabilities TTL.
+    // -----------------------------------------------------------------------
+    // SWR refresh: last-known-good preservation + idempotency (#236)
+    // -----------------------------------------------------------------------
+
+    /// A refresh carrying invalid metadata must be rejected *before* any write,
+    /// leaving the previously cached (last-known-good) entry intact.
     #[test]
-    fn test_cache_capabilities_uses_configured_ttl_when_override_is_zero() {
+    fn test_refresh_swr_preserves_last_known_good_on_invalid() {
         let env = make_env();
-        set_ledger(&env, 0);
-        let contract_id = env.register_contract(None, AnchorKitContract);
-        let client = AnchorKitContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let anchor = Address::generate(&env);
-        client.initialize(&admin);
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
 
-        use crate::contract::CacheConfig;
-        client.set_cache_config(&CacheConfig {
-            metadata_ttl_seconds: 50,
-            capabilities_ttl_seconds: 80,
-            swr_ttl_seconds: 10,
-        });
+        let good = sample_metadata(&env, &anchor);
+        client.cache_metadata_swr(&anchor, &good, &100u64, &50u64);
 
-        let toml_url = String::from_str(&env, "https://anchor.example/.well-known/stellar.toml");
-        let caps = String::from_str(&env, "{\"deposits\":true}");
-        client.cache_capabilities(&anchor, &toml_url, &caps, &0u64);
+        // Invalid: metadata.anchor does not match the key anchor.
+        let other = Address::generate(&env);
+        let mut bad = sample_metadata(&env, &anchor);
+        bad.anchor = other;
+        bad.reputation_score = 1; // would be observable if it leaked in
+        let result = client.try_refresh_metadata_cache_swr(&anchor, &bad, &100u64, &50u64);
+        assert!(result.is_err());
 
-        // Fresh at t=79
-        set_ledger(&env, 79);
-        let cached = client.get_cached_capabilities(&anchor);
-        assert_eq!(cached.capabilities, caps);
+        // Last-known-good still served, unchanged.
+        let (retrieved, needs_refresh) = client.get_cached_metadata_swr(&anchor);
+        assert_eq!(retrieved.reputation_score, 9000);
+        assert!(!needs_refresh);
+    }
 
-        // Expired at t=81
-        set_ledger(&env, 81);
-        assert!(client.try_get_cached_capabilities(&anchor).is_err());
+    /// Invalid uptime is also rejected, preserving the cached entry.
+    #[test]
+    fn test_refresh_swr_rejects_out_of_range_uptime() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
+
+        let good = sample_metadata(&env, &anchor);
+        client.cache_metadata_swr(&anchor, &good, &100u64, &50u64);
+
+        let mut bad = sample_metadata(&env, &anchor);
+        bad.uptime_percentage = 10_001;
+        assert!(client.try_refresh_metadata_cache_swr(&anchor, &bad, &100u64, &50u64).is_err());
+
+        let (retrieved, _) = client.get_cached_metadata_swr(&anchor);
+        assert_eq!(retrieved.uptime_percentage, 9900);
+    }
+
+    /// Refreshing with identical data while still fresh must NOT reset the
+    /// `cached_at` clock (idempotent). We observe this indirectly: if the clock
+    /// were reset the entry would still be fresh later; because it is not, the
+    /// entry becomes stale on the original schedule.
+    #[test]
+    fn test_refresh_swr_idempotent_when_fresh() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
+
+        let meta = sample_metadata(&env, &anchor);
+        client.cache_metadata_swr(&anchor, &meta, &100u64, &50u64);
+
+        // At t=1050 (age 50, fresh) refresh with identical data.
+        set_ledger(&env, 1050);
+        let same = sample_metadata(&env, &anchor);
+        client.refresh_metadata_cache_swr(&anchor, &same, &100u64, &50u64);
+
+        // At t=1120 (age 120 from original t=1000) the entry must be Stale,
+        // proving the clock was NOT reset to 1050 (which would still be fresh).
+        set_ledger(&env, 1120);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Stale);
+    }
+
+    /// Refreshing with changed data resets the clock and writes the new values.
+    #[test]
+    fn test_refresh_swr_updates_when_data_changed() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
+
+        let meta = sample_metadata(&env, &anchor);
+        client.cache_metadata_swr(&anchor, &meta, &100u64, &50u64);
+
+        // At t=1050 refresh with changed data.
+        set_ledger(&env, 1050);
+        let mut updated = sample_metadata(&env, &anchor);
+        updated.reputation_score = 9500;
+        client.refresh_metadata_cache_swr(&anchor, &updated, &100u64, &50u64);
+
+        // New value is served and the clock reset (fresh well past original expiry).
+        set_ledger(&env, 1120);
+        let (retrieved, needs_refresh) = client.get_cached_metadata_swr(&anchor);
+        assert_eq!(retrieved.reputation_score, 9500);
+        assert!(!needs_refresh);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Fresh);
+    }
+
+    /// A stale entry can be revived by an SWR refresh, returning to Fresh with
+    /// the new last-known-good data.
+    #[test]
+    fn test_refresh_swr_revives_stale_entry() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, _, anchor) = setup_swr(&env);
+
+        let meta = sample_metadata(&env, &anchor);
+        client.cache_metadata_swr(&anchor, &meta, &100u64, &50u64);
+
+        // Enter the stale window.
+        set_ledger(&env, 1120);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Stale);
+
+        // Refresh with new data revives it to Fresh.
+        let mut updated = sample_metadata(&env, &anchor);
+        updated.reputation_score = 9100;
+        client.refresh_metadata_cache_swr(&anchor, &updated, &100u64, &50u64);
+        assert_eq!(client.get_metadata_cache_state(&anchor), MetadataCacheState::Fresh);
+        let (retrieved, needs_refresh) = client.get_cached_metadata_swr(&anchor);
+        assert_eq!(retrieved.reputation_score, 9100);
+        assert!(!needs_refresh);
     }
 }
 

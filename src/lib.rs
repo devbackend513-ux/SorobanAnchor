@@ -118,7 +118,7 @@ pub mod stellar_toml;
 
 pub use domain_validator::validate_anchor_domain;
 pub use errors::{AnchorKitError, ErrorCode};
-pub use stellar_toml::{ParsedStellarToml, parse_stellar_toml, fetch_stellar_toml_url};
+pub use stellar_toml::{ParsedCurrency, ParsedStellarToml, parse_stellar_toml, fetch_stellar_toml_url};
 
 /// Backward-compatible alias. Prefer [`AnchorKitError`] for new code.
 pub use errors::Error;
@@ -130,8 +130,8 @@ pub use response_validator::{
     Sep38QuoteResponse, WithdrawResponse,
 };
 pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
-pub use deterministic_hash::{compute_payload_hash, verify_payload_hash, verify_hash_bytes};
-pub use webhook::{deliver_webhook, get_dead_letter_webhooks, WebhookDeliveryConfig};
+pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
+pub use webhook::{deliver_webhook, get_dead_letter_webhooks, query_dlq, WebhookDeliveryConfig, DlqEntry};
 
 pub use sep6::{
     fetch_transaction_status, initiate_deposit, initiate_withdrawal, DepositResponse,
