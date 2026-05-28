@@ -82,6 +82,7 @@ pub enum ErrorCode {
     IllegalTransition         = 24,
     SessionExpired            = 25,
     SessionClosed             = 26,
+    UnsupportedCapabilityVersion = 27,
 
     // Session / routing errors (27–30)
     SessionOperationLimitExceeded = 27,
@@ -474,6 +475,7 @@ mod tests {
         assert_eq!(ErrorCode::IllegalTransition     as u32, 24);
         assert_eq!(ErrorCode::SessionExpired        as u32, 25);
         assert_eq!(ErrorCode::SessionClosed         as u32, 26);
+        assert_eq!(ErrorCode::UnsupportedCapabilityVersion as u32, 27);
         assert_eq!(ErrorCode::CacheExpired          as u32, 48);
         assert_eq!(ErrorCode::CacheNotFound         as u32, 49);
         assert_eq!(ErrorCode::AttestorProfileNotFound as u32, 50);
