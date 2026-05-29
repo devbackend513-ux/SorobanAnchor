@@ -3,13 +3,12 @@
 //! Provides normalized service functions for initiating interactive deposits,
 //! interactive withdrawals, and fetching transaction status for SEP-24 flows.
 
-#![cfg_attr(not(test), no_std)]
-
 extern crate alloc;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 
 use crate::domain_validator::validate_anchor_domain;
 use crate::errors::{AnchorKitError, ErrorCode};
+use crate::errors::normalize_asset_code;
 use crate::sep6::TransactionStatus;
 
 /// Raw response from anchor's `/transactions/deposit/interactive` endpoint.
@@ -33,6 +32,8 @@ pub struct RawSep24TransactionResponse {
     pub status: String,
     pub more_info_url: Option<String>,
     pub stellar_transaction_id: Option<String>,
+    /// Asset code for this transaction (e.g. `"USDC"`). Normalized to uppercase.
+    pub asset_code: Option<String>,
 }
 
 /// Normalized response for interactive deposit initiation.
@@ -64,6 +65,8 @@ pub struct Sep24TransactionStatusResponse {
     pub more_info_url: Option<String>,
     /// Stellar transaction ID if available (SEP-24 specific).
     pub stellar_transaction_id: Option<String>,
+    /// Normalized (uppercase) asset code, if provided.
+    pub asset_code: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -71,8 +74,47 @@ pub struct Sep24TransactionStatusResponse {
 // ---------------------------------------------------------------------------
 
 /// Validates that a SEP-24 interactive flow URL is a well-formed HTTPS URL.
-/// Delegates to `validate_anchor_domain` to avoid duplicating logic.
+///
+/// In addition to the base `validate_anchor_domain` checks, this function also:
+/// - Rejects URLs with embedded userinfo (`https://user:pass@host/...`)
+/// - Rejects IP literals in brackets (`https://[::1]/...`)
+/// - Rejects excessively long individual URL components (host > 253 chars, path > 2048 chars)
 pub fn validate_interactive_url(url: &str) -> Result<(), AnchorKitError> {
+    if url.is_empty() {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
+    // Must start with https://
+    if !url.starts_with("https://") {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
+    let after_scheme = &url[8..]; // skip "https://"
+
+    // Reject IP literals: https://[...]
+    if after_scheme.starts_with('[') {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
+    // Reject userinfo: presence of '@' before the first '/' indicates user:pass@host
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if authority.contains('@') {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
+    // Reject excessively long host component (RFC 1035: max 253 chars)
+    let host = authority.split(':').next().unwrap_or(authority);
+    if host.len() > 253 {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
+    // Reject excessively long path component
+    let path = &after_scheme[authority_end..];
+    if path.len() > 2048 {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
     validate_anchor_domain(url).map_err(|_| AnchorKitError::invalid_endpoint_format())
 }
 
@@ -212,6 +254,7 @@ pub fn initiate_interactive_withdrawal(
 ///     status: "completed".into(),
 ///     more_info_url: Some("https://anchor.example.com/tx/tx-789".into()),
 ///     stellar_transaction_id: Some("stellar-tx-123".into()),
+///     asset_code: None,
 /// };
 /// let resp = fetch_sep24_transaction_status(raw).unwrap();
 /// assert_eq!(resp.status, TransactionStatus::Completed);
@@ -235,21 +278,23 @@ pub fn fetch_sep24_transaction_status(
     if let Some(ref url) = raw.more_info_url {
         validate_interactive_url(url)?;
     }
+    let asset_code = raw.asset_code.as_deref()
+        .map(normalize_asset_code)
+        .transpose()?;
 
     Ok(Sep24TransactionStatusResponse {
         id: raw.id,
         status: TransactionStatus::from_str(&raw.status),
         more_info_url: raw.more_info_url,
         stellar_transaction_id: raw.stellar_transaction_id,
+        asset_code,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // validate_interactive_url
+    use alloc::string::ToString;
     // -----------------------------------------------------------------------
 
     #[test]
@@ -276,6 +321,36 @@ mod tests {
     #[test]
     fn test_validate_interactive_url_rejects_empty() {
         assert!(validate_interactive_url("").is_err());
+    }
+
+    #[test]
+    fn test_validate_interactive_url_rejects_userinfo() {
+        assert!(validate_interactive_url("https://user:pass@anchor.example.com/deposit").is_err());
+        assert!(validate_interactive_url("https://user@anchor.example.com/deposit").is_err());
+    }
+
+    #[test]
+    fn test_validate_interactive_url_rejects_ip_literal() {
+        assert!(validate_interactive_url("https://[::1]/deposit").is_err());
+        assert!(validate_interactive_url("https://[2001:db8::1]/deposit").is_err());
+    }
+
+    #[test]
+    fn test_validate_interactive_url_rejects_long_host() {
+        // 254-char host (exceeds RFC 1035 limit of 253)
+        let long_host = alloc::format!("https://{}.com/path", "a".repeat(250));
+        assert!(validate_interactive_url(&long_host).is_err());
+    }
+
+    #[test]
+    fn test_validate_interactive_url_rejects_long_path() {
+        let long_path = alloc::format!("https://anchor.example.com/{}", "a".repeat(2049));
+        assert!(validate_interactive_url(&long_path).is_err());
+    }
+
+    #[test]
+    fn test_validate_interactive_url_accepts_valid_with_path_and_query() {
+        assert!(validate_interactive_url("https://anchor.example.com/sep24/deposit?asset=USDC").is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -432,6 +507,7 @@ mod tests {
             status: "completed".to_string(),
             more_info_url: Some("https://anchor.example.com/tx/tx-789".to_string()),
             stellar_transaction_id: Some("stellar-tx-123".to_string()),
+            asset_code: None,
         };
         let result = fetch_sep24_transaction_status(raw).unwrap();
         assert_eq!(result.id, "tx-789");
@@ -453,6 +529,7 @@ mod tests {
             status: "completed".to_string(),
             more_info_url: Some("http://anchor.example.com/tx/tx-789".to_string()),
             stellar_transaction_id: None,
+            asset_code: None,
         };
         assert!(fetch_sep24_transaction_status(raw).is_err());
     }
@@ -464,6 +541,7 @@ mod tests {
             status: "completed".to_string(),
             more_info_url: Some("/tx/tx-789".to_string()),
             stellar_transaction_id: None,
+            asset_code: None,
         };
         assert!(fetch_sep24_transaction_status(raw).is_err());
     }
@@ -475,6 +553,7 @@ mod tests {
             status: "completed".to_string(),
             more_info_url: None,
             stellar_transaction_id: None,
+            asset_code: None,
         };
         assert!(fetch_sep24_transaction_status(raw).is_ok());
     }
@@ -486,6 +565,7 @@ mod tests {
             status: "completed".to_string(),
             more_info_url: None,
             stellar_transaction_id: None,
+            asset_code: None,
         };
         assert!(fetch_sep24_transaction_status(raw).is_err());
     }
@@ -497,6 +577,7 @@ mod tests {
             status: "".to_string(),
             more_info_url: None,
             stellar_transaction_id: None,
+            asset_code: None,
         };
         assert!(fetch_sep24_transaction_status(raw).is_err());
     }
@@ -508,6 +589,7 @@ mod tests {
             status: "pending_user".to_string(),
             more_info_url: None,
             stellar_transaction_id: None,
+            asset_code: None,
         };
         let result = fetch_sep24_transaction_status(raw).unwrap();
         assert_eq!(result.status, TransactionStatus::PendingUser);
