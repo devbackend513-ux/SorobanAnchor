@@ -102,6 +102,101 @@ Anchor configs live in `configs/` as JSON or TOML. Validate them with:
 
 Schema reference: `config_schema.json`
 
+## Integration Testing
+
+The repository ships a CLI integration test harness that exercises the full
+deploy → initialize → register → attest → verify workflow using the Soroban
+local simulation environment (no network required by default).
+
+```bash
+# Run all integration harness tests (local simulation)
+cargo test --test cli_integration_harness
+
+# Or via Make
+make integration-test
+```
+
+The harness covers:
+
+| Step | What is tested |
+|------|---------------|
+| 1 | Contract deployment and admin initialization |
+| 2 | Attestor registration (SEP-10 JWT flow) |
+| 3 | Service capability configuration |
+| 4 | Attestation submission and retrieval |
+| 5 | Session-based workflow with audit logging |
+| 6 | Quote submission and LowestFee routing |
+| 7 | Attestor revocation and cleanup |
+| E2E | Full pipeline in a single test |
+| 9 | KYC submit → approve workflow |
+| 10 | CLI binary smoke tests (`doctor`, `deploy --dry-run`) |
+| 11 | Live testnet smoke test (opt-in) |
+
+### Live testnet tests
+
+Set the following environment variables to run the live testnet step:
+
+```bash
+export SOROBAN_ANCHOR_INTEGRATION=testnet
+export ANCHOR_CONTRACT_ID=<deployed-contract-id>
+export ANCHOR_ADMIN_SECRET=<admin-secret-key>
+
+make integration-test-live
+```
+
+## Release Packaging
+
+Production releases are built and bundled with a single Make target:
+
+```bash
+make release
+```
+
+This runs `scripts/package_release.sh` which:
+
+1. Ensures the `wasm32-unknown-unknown` Rust target is installed.
+2. Builds the native CLI binary (`target/release/anchorkit`).
+3. Builds the optimized WASM contract (`target/wasm32-unknown-unknown/release/anchorkit.wasm`).
+4. Runs `wasm-opt -Oz` if binaryen is available.
+5. Assembles a bundle directory under `dist/anchorkit-<VERSION>/` containing:
+   - `anchorkit` — CLI binary
+   - `anchorkit.wasm` — Soroban WASM contract
+   - `schemas/config_schema.json` — JSON schema for anchor configs
+   - `configs/` — Example anchor configurations (JSON + TOML)
+   - `docs/` — Documentation
+   - `README.md`, `LICENSE`, `VERSION`
+6. Creates `dist/anchorkit-<VERSION>.tar.gz`.
+7. Generates a SHA-256 checksum file.
+
+### Validating the bundle
+
+```bash
+make release-validate
+# or directly:
+./scripts/validate_bundle.sh dist/anchorkit-0.1.0.tar.gz
+```
+
+The validation script checks that all required artifacts are present and that
+JSON files are well-formed.
+
+### Cleaning up
+
+```bash
+make clean-dist   # removes dist/
+```
+
+## Governance and Security
+
+SorobanAnchor follows a documented governance and security model covering:
+
+- **Roles** — Maintainers, Contributors, Security Reviewers, and on-chain Attestors.
+- **Contract upgrades** — Require two maintainer approvals, a reproducible WASM build, and a published SHA-256 checksum. Only the admin address recorded at contract initialization may authorize upgrades.
+- **Admin key management** — Multi-signature setup (2-of-N); keys are never committed to the repository; mainnet keys are stored on offline hardware wallets.
+- **Dependency auditing** — `cargo audit` runs in CI on every PR; all dependencies are pinned to exact versions and `Cargo.lock` is committed.
+- **Responsible disclosure** — Report vulnerabilities privately via GitHub's security advisory feature. We follow coordinated disclosure with a 14-day fix window.
+
+Full details: [`docs/governance-and-security.md`](docs/governance-and-security.md)
+
 ## License
 
 MIT
