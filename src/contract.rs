@@ -10,6 +10,7 @@ use crate::errors::ErrorCode;
 use crate::rate_limiter::RateLimiter;
 use crate::sep10_jwt;
 use crate::transaction_state_tracker::{OptRecovery, TransactionState, TransactionStateRecord};
+use crate::replay_detection::{self, ReplayMetrics};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,6 +42,10 @@ pub struct Quote {
     pub valid_until: u64,
     /// Schema version for this record. See [`SCHEMA_V1`].
     pub schema_version: u32,
+    /// Optional routing reason or referral code explaining why this route/anchor
+    /// was chosen (e.g. `"lowest_fee"`, `"preferred_anchor"`, `"referral"`).
+    /// `None` when no reason was recorded.
+    pub routing_reason: Option<String>,
 }
 
 #[contracttype]
@@ -833,6 +838,8 @@ struct QuoteSubmitEvent {
     quote_asset: String,
     rate: u64,
     valid_until: u64,
+    /// Optional routing reason recorded at quote submission time.
+    routing_reason: Option<String>,
 }
 
 #[contracttype]
@@ -995,6 +1002,32 @@ fn compliance_check_key(env: &Env, subject: &Address, check_type: &String) -> By
     let ct_xdr = check_type.clone().to_xdr(env);
     let ct_bytes = xdr_to_vec(&ct_xdr);
     make_storage_key(env, &[b"COMP", &raw, &ct_bytes])
+}
+
+fn compliance_history_count_key(env: &Env, subject: &Address, check_type: &String) -> BytesN<32> {
+    let xdr = subject.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    let ct_xdr = check_type.clone().to_xdr(env);
+    let ct_bytes = xdr_to_vec(&ct_xdr);
+    make_storage_key(env, &[b"COMPHCNT", &raw, &ct_bytes])
+}
+
+fn compliance_history_entry_key(env: &Env, subject: &Address, check_type: &String, idx: u64) -> BytesN<32> {
+    let xdr = subject.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    let ct_xdr = check_type.clone().to_xdr(env);
+    let ct_bytes = xdr_to_vec(&ct_xdr);
+    make_storage_key(env, &[b"COMPHIST", &raw, &ct_bytes, &idx.to_be_bytes()])
+}
+
+fn compliance_subject_index_key(env: &Env, subject: &Address) -> BytesN<32> {
+    let xdr = subject.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    make_storage_key(env, &[b"COMPIDX", &raw])
+}
+
+fn audit_retention_key(env: &Env) -> BytesN<32> {
+    make_storage_key(env, &[b"AUDITRET"])
 }
 
 fn anchor_meta_key(env: &Env, anchor: &Address) -> BytesN<32> {
@@ -2284,6 +2317,9 @@ impl AnchorKitContract {
     /// - the service list is empty, contains duplicates, or contains a code the
     ///   current version does not recognise (`InvalidServiceType`)
     ///
+    /// Services are stored in deterministic sorted order (ascending) regardless
+    /// of submission order, ensuring consistent storage and event emission (#258).
+    ///
     /// On success the record is stored stamped with `version` so capability
     /// discovery is explicit. Re-configuring overwrites the previous record,
     /// which is how an anchor migrates to a newer version.
@@ -2339,7 +2375,12 @@ impl AnchorKitContract {
         if services.is_empty() {
             panic_with_error!(&env, ErrorCode::InvalidServiceType);
         }
+        
+        // Validate and normalize services: check for duplicates, validate codes,
+        // and sort deterministically for consistent storage and event emission.
         let mut seen = Vec::new(&env);
+        let mut normalized = Vec::new(&env);
+        
         for s in services.iter() {
             if seen.contains(&s) {
                 panic_with_error!(&env, ErrorCode::InvalidServiceType);
@@ -2348,10 +2389,16 @@ impl AnchorKitContract {
                 panic_with_error!(&env, ErrorCode::InvalidServiceType);
             }
             seen.push_back(s);
+            normalized.push_back(s);
         }
+        
+        // Sort services deterministically (ascending order) for consistent storage
+        // and predictable behavior regardless of submission order.
+        Self::sort_services(&env, &mut normalized);
+        
         let record = AnchorServices {
             anchor: anchor.clone(),
-            services: services.clone(),
+            services: normalized,
             service_capability_version: version,
         };
         let key = make_storage_key(&env, &[b"SERVICES", &raw]);
@@ -2529,6 +2576,9 @@ impl AnchorKitContract {
         let hash_raw = xdr_to_vec(&payload_hash);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
+            // Record replay detection event and metrics before panicking
+            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
@@ -2584,6 +2634,9 @@ impl AnchorKitContract {
         let hash_raw = xdr_to_vec(&payload_hash);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
+            // Record replay detection event and metrics before panicking
+            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
@@ -2635,6 +2688,9 @@ impl AnchorKitContract {
         let hash_raw = xdr_to_vec(&payload_hash);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
+            // Record replay detection event and metrics before panicking
+            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
@@ -2710,6 +2766,64 @@ impl AnchorKitContract {
 
         // Propagate operation name into RequestContext
         Self::record_operation_in_context(&env, &request_id.id, String::from_str(&env, "submit_quote"));
+    }
+
+    /// Record a tracing span for a quote submission, including optional routing
+    /// reason metadata in the span operation name (#298).
+    ///
+    /// Behaves exactly like [`quote_with_request_id`] but when `routing_reason`
+    /// is `Some`, the span operation is annotated as
+    /// `"submit_quote_with_reason"` and the reason is recorded in the
+    /// [`RequestContext`] operation chain so downstream audit consumers can
+    /// correlate the reason with the request.
+    ///
+    /// # Arguments
+    ///
+    /// * `routing_reason` – Optional routing reason to attach to the span.
+    ///   When `None` the behaviour is identical to [`quote_with_request_id`].
+    #[allow(unused_variables)]
+    pub fn quote_with_request_id_and_reason(
+        env: Env,
+        request_id: RequestId,
+        anchor: Address,
+        from_asset: String,
+        to_asset: String,
+        amount: u64,
+        fee_bps: u32,
+        min_amount: u64,
+        max_amount: u64,
+        expires_at: u64,
+        routing_reason: Option<String>,
+    ) {
+        anchor.require_auth();
+        let xdr = anchor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let services_record = env
+            .storage()
+            .persistent()
+            .get::<_, AnchorServices>(&make_storage_key(&env, &[b"SERVICES", &raw]))
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ServicesNotConfigured));
+        if !services_record.services.contains(&SERVICE_QUOTES) {
+            panic_with_error!(&env, ErrorCode::ServicesNotConfigured);
+        }
+        let now = env.ledger().timestamp();
+
+        // Choose the operation label based on whether a reason was supplied so
+        // the span is self-describing in audit queries.
+        let operation = if routing_reason.is_some() {
+            String::from_str(&env, "submit_quote_with_reason")
+        } else {
+            String::from_str(&env, "submit_quote")
+        };
+
+        Self::store_span(
+            &env, &request_id,
+            operation.clone(),
+            anchor, now,
+            String::from_str(&env, "success"),
+        );
+
+        Self::record_operation_in_context(&env, &request_id.id, operation);
     }
 
     // -----------------------------------------------------------------------
@@ -3059,7 +3173,8 @@ impl AnchorKitContract {
     // -----------------------------------------------------------------------
 
     /// Record a compliance check result for a subject (admin-only).
-    /// Stores a `ComplianceCheck` record and emits a `compliance_checked` event.
+    /// Stores the latest `ComplianceCheck` record, appends to history, and updates the
+    /// per-subject check-type index so auditors can query decision histories.
     pub fn record_compliance_check(
         env: Env,
         subject: Address,
@@ -3076,13 +3191,88 @@ impl AnchorKitContract {
             score,
             timestamp: now,
         };
+
+        // Store latest (keyed by subject + check_type)
         let key = compliance_check_key(&env, &subject, &check_type);
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Append to ordered history
+        let hist_cnt_key = compliance_history_count_key(&env, &subject, &check_type);
+        let idx: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&hist_cnt_key)
+            .unwrap_or(0u64);
+        let hist_key = compliance_history_entry_key(&env, &subject, &check_type, idx);
+        env.storage().persistent().set(&hist_key, &record);
+        env.storage().persistent().extend_ttl(&hist_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.storage().persistent().set(&hist_cnt_key, &(idx + 1));
+        env.storage().persistent().extend_ttl(&hist_cnt_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Update per-subject check-type index
+        let idx_key = compliance_subject_index_key(&env, &subject);
+        let mut check_types: Vec<String> = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<String>>(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !check_types.contains(&check_type) {
+            check_types.push_back(check_type.clone());
+            env.storage().persistent().set(&idx_key, &check_types);
+            env.storage().persistent().extend_ttl(&idx_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        }
+
         env.events().publish(
             (symbol_short!("comp"), symbol_short!("checked"), subject),
             record,
         );
+    }
+
+    /// Return the most recent compliance check record for `(subject, check_type)`, or
+    /// `None` if no check has been recorded.
+    pub fn get_latest_compliance_check(
+        env: Env,
+        subject: Address,
+        check_type: String,
+    ) -> Option<ComplianceCheck> {
+        let key = compliance_check_key(&env, &subject, &check_type);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Return the ordered history of compliance checks for `(subject, check_type)`.
+    /// Returns up to `limit` records (capped at 50), most-recent last.
+    pub fn get_compliance_check_history(
+        env: Env,
+        subject: Address,
+        check_type: String,
+        limit: u64,
+    ) -> Vec<ComplianceCheck> {
+        let hist_cnt_key = compliance_history_count_key(&env, &subject, &check_type);
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&hist_cnt_key)
+            .unwrap_or(0u64);
+        let effective_limit = limit.min(50);
+        let start = if total > effective_limit { total - effective_limit } else { 0 };
+        let mut results = Vec::new(&env);
+        for i in start..total {
+            let hist_key = compliance_history_entry_key(&env, &subject, &check_type, i);
+            if let Some(entry) = env.storage().persistent().get::<_, ComplianceCheck>(&hist_key) {
+                results.push_back(entry);
+            }
+        }
+        results
+    }
+
+    /// Return all check types that have been recorded for a given subject.
+    pub fn list_subject_compliance_checks(env: Env, subject: Address) -> Vec<String> {
+        let idx_key = compliance_subject_index_key(&env, &subject);
+        env.storage()
+            .persistent()
+            .get::<_, Vec<String>>(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // -----------------------------------------------------------------------
@@ -3206,6 +3396,7 @@ impl AnchorKitContract {
             base_asset: base_asset.clone(), quote_asset: quote_asset.clone(),
             rate, fee_percentage, minimum_amount, maximum_amount, valid_until,
             schema_version: SCHEMA_V1,
+            routing_reason: None,
         };
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &next.to_be_bytes()]);
         env.storage().persistent().set(&q_key, &quote);
@@ -3217,9 +3408,82 @@ impl AnchorKitContract {
 
         env.events().publish(
             (symbol_short!("quote"), symbol_short!("submit"), next),
-            QuoteSubmitEvent { quote_id: next, anchor, base_asset, quote_asset, rate, valid_until },
+            QuoteSubmitEvent { quote_id: next, anchor, base_asset, quote_asset, rate, valid_until, routing_reason: None },
         );
         next
+    }
+
+    /// Submit a quote with optional routing reason metadata (#298).
+    ///
+    /// Identical to [`submit_quote`] but records an optional `routing_reason`
+    /// alongside the quote for audit and customer-support purposes. The reason
+    /// is persisted in the [`Quote`] record and emitted in the submit event so
+    /// it is available for off-chain audit consumers.
+    ///
+    /// # Arguments
+    ///
+    /// * `routing_reason` – Human-readable code explaining why this anchor/route
+    ///   was chosen (e.g. `"lowest_fee"`, `"referral"`, `"preferred_anchor"`).
+    ///   Pass `None` when no reason applies.
+    pub fn submit_quote_with_reason(
+        env: Env,
+        anchor: Address,
+        base_asset: String,
+        quote_asset: String,
+        rate: u64,
+        fee_percentage: u32,
+        minimum_amount: u64,
+        maximum_amount: u64,
+        valid_until: u64,
+        routing_reason: Option<String>,
+    ) -> u64 {
+        anchor.require_auth();
+        validate_currency_code(&env, &base_asset);
+        validate_currency_code(&env, &quote_asset);
+        validate_fee_percent(&env, fee_percentage);
+        validate_amount_limits(&env, minimum_amount, maximum_amount);
+        let inst = env.storage().instance();
+        let qcnt_key = make_storage_key(&env, &[b"QCNT"]);
+        let next: u64 = inst.get(&qcnt_key).unwrap_or(0u64) + 1;
+        inst.set(&qcnt_key, &next);
+        inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+
+        let anchor_xdr = anchor.clone().to_xdr(&env);
+        let anchor_raw = xdr_to_vec(&anchor_xdr);
+        let quote = Quote {
+            quote_id: next, anchor: anchor.clone(),
+            base_asset: base_asset.clone(), quote_asset: quote_asset.clone(),
+            rate, fee_percentage, minimum_amount, maximum_amount, valid_until,
+            schema_version: SCHEMA_V1,
+            routing_reason: routing_reason.clone(),
+        };
+        let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &next.to_be_bytes()]);
+        env.storage().persistent().set(&q_key, &quote);
+        env.storage().persistent().extend_ttl(&q_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
+        env.storage().persistent().set(&lq_key, &next);
+        env.storage().persistent().extend_ttl(&lq_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (symbol_short!("quote"), symbol_short!("submit"), next),
+            QuoteSubmitEvent { quote_id: next, anchor, base_asset, quote_asset, rate, valid_until, routing_reason },
+        );
+        next
+    }
+
+    /// Retrieve the routing reason stored with a quote (#298).
+    ///
+    /// Returns `None` when the quote was submitted without a reason or does not
+    /// exist. Callers that need the full quote record should use [`get_quote`].
+    pub fn get_quote_routing_reason(env: Env, anchor: Address, quote_id: u64) -> Option<String> {
+        let anchor_xdr = anchor.to_xdr(&env);
+        let anchor_raw = xdr_to_vec(&anchor_xdr);
+        let key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
+        env.storage()
+            .persistent()
+            .get::<_, Quote>(&key)
+            .and_then(|q| q.routing_reason)
     }
 
     pub fn receive_quote(env: Env, receiver: Address, anchor: Address, quote_id: u64) -> Quote {
@@ -3317,6 +3581,9 @@ impl AnchorKitContract {
             &env, &[b"SESSREQ", &session_id.to_be_bytes(), &hash_raw],
         );
         if env.storage().persistent().has(&sess_req_key) {
+            // Record replay detection event and metrics before panicking
+            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
         env.storage().persistent().set(&sess_req_key, &true);
@@ -3326,6 +3593,9 @@ impl AnchorKitContract {
         let issuer_raw = xdr_to_vec(&issuer_xdr);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
+            // Record replay detection event and metrics before panicking
+            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
@@ -3541,6 +3811,97 @@ impl AnchorKitContract {
             .persistent()
             .get::<_, u64>(&make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]))
             .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit log retention and pagination (#251)
+    // -----------------------------------------------------------------------
+
+    /// Set the audit log retention policy in days (admin-only).
+    /// A value of 0 means no automatic retention limit is enforced.
+    pub fn set_audit_log_retention(env: Env, retention_days: u64) {
+        Self::require_admin(&env);
+        let key = audit_retention_key(&env);
+        env.storage().instance().set(&key, &retention_days);
+        env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    }
+
+    /// Return the configured audit log retention policy in days (0 = unlimited).
+    pub fn get_audit_log_retention(env: Env) -> u64 {
+        let key = audit_retention_key(&env);
+        env.storage().instance().get::<_, u64>(&key).unwrap_or(0u64)
+    }
+
+    /// Return the total number of audit log entries ever written.
+    pub fn get_audit_log_count(env: Env) -> u64 {
+        let acnt_key = make_storage_key(&env, &[b"ACNT"]);
+        env.storage().instance().get::<_, u64>(&acnt_key).unwrap_or(0u64)
+    }
+
+    /// Return a page of audit log entries starting at `offset`, up to `limit` entries
+    /// (capped at 50 per call to bound WASM execution).
+    pub fn get_audit_logs_paginated(env: Env, offset: u64, limit: u64) -> Vec<AuditLog> {
+        let acnt_key = make_storage_key(&env, &[b"ACNT"]);
+        let total: u64 = env.storage().instance().get::<_, u64>(&acnt_key).unwrap_or(0u64);
+        let effective_limit = limit.min(50);
+        let end = (offset + effective_limit).min(total);
+        let mut results = Vec::new(&env);
+        for i in offset..end {
+            let audit_key = make_storage_key(&env, &[b"AUDIT", &i.to_be_bytes()]);
+            if let Some(entry) = env.storage().persistent().get::<_, AuditLog>(&audit_key) {
+                results.push_back(entry);
+            }
+        }
+        results
+    }
+
+    /// Paginated retrieval of audit logs scoped to a specific session.
+    /// Returns up to `limit` entries (capped at 50) starting at `offset` within the session.
+    pub fn get_session_logs_paginated(
+        env: Env,
+        session_id: u64,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<AuditLog> {
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]))
+            .unwrap_or(0u64);
+        let effective_limit = limit.min(50);
+        let end = (offset + effective_limit).min(total);
+        let mut results = Vec::new(&env);
+        for i in offset..end {
+            let slog_key = make_storage_key(&env, &[b"SLOG", &session_id.to_be_bytes(), &i.to_be_bytes()]);
+            if let Some(log_id) = env.storage().persistent().get::<_, u64>(&slog_key) {
+                let audit_key = make_storage_key(&env, &[b"AUDIT", &log_id.to_be_bytes()]);
+                if let Some(entry) = env.storage().persistent().get::<_, AuditLog>(&audit_key) {
+                    results.push_back(entry);
+                }
+            }
+        }
+        results
+    }
+
+    /// Remove audit log entries whose `operation.timestamp` is strictly before
+    /// `before_timestamp`. Scans up to the first 100 log IDs to remain WASM-safe.
+    /// Returns the number of entries pruned.
+    pub fn prune_audit_logs(env: Env, before_timestamp: u64) -> u64 {
+        Self::require_admin(&env);
+        let acnt_key = make_storage_key(&env, &[b"ACNT"]);
+        let total: u64 = env.storage().instance().get::<_, u64>(&acnt_key).unwrap_or(0u64);
+        let scan_limit = total.min(100);
+        let mut pruned: u64 = 0;
+        for i in 0..scan_limit {
+            let audit_key = make_storage_key(&env, &[b"AUDIT", &i.to_be_bytes()]);
+            if let Some(entry) = env.storage().persistent().get::<_, AuditLog>(&audit_key) {
+                if entry.operation.timestamp < before_timestamp {
+                    env.storage().persistent().remove(&audit_key);
+                    pruned += 1;
+                }
+            }
+        }
+        pruned
     }
 
     // -----------------------------------------------------------------------
@@ -4563,9 +4924,40 @@ impl AnchorKitContract {
         transaction_id: u64,
         initiator: Address,
     ) -> TransactionStateRecord {
+        Self::create_transaction_record_internal(&env, transaction_id, initiator, None)
+    }
+
+    /// Create a transaction record with optional routing reason metadata (#298).
+    ///
+    /// Identical to [`create_transaction_record`] but attaches an optional
+    /// `routing_reason` to the record so callers can store why a particular
+    /// route or anchor was chosen. The reason persists through all subsequent
+    /// state transitions and can be retrieved for auditing via
+    /// [`get_transaction_record`].
+    ///
+    /// # Arguments
+    ///
+    /// * `routing_reason` – Human-readable code or description explaining why
+    ///   this route was chosen (e.g. `"referral"`, `"lowest_fee"`). `None`
+    ///   when no reason applies.
+    pub fn create_transaction_record_with_reason(
+        env: Env,
+        transaction_id: u64,
+        initiator: Address,
+        routing_reason: Option<String>,
+    ) -> TransactionStateRecord {
+        Self::create_transaction_record_internal(&env, transaction_id, initiator, routing_reason)
+    }
+
+    fn create_transaction_record_internal(
+        env: &Env,
+        transaction_id: u64,
+        initiator: Address,
+        routing_reason: Option<String>,
+    ) -> TransactionStateRecord {
         let now = env.ledger().timestamp();
         let current_ledger = env.ledger().sequence();
-        let mut history = soroban_sdk::Vec::new(&env);
+        let mut history = soroban_sdk::Vec::new(env);
         history.push_back((TransactionState::Pending, now));
         let record = TransactionStateRecord {
             transaction_id,
@@ -4577,6 +4969,7 @@ impl AnchorKitContract {
             error_message: None,
             state_history: history,
             recovery_metadata: OptRecovery::None,
+            routing_reason,
         };
         let key = (symbol_short!("TXSTATE"), transaction_id);
         env.storage().persistent().set(&key, &record);
@@ -4585,7 +4978,7 @@ impl AnchorKitContract {
         let ids_key = symbol_short!("TXIDS");
         let mut ids: soroban_sdk::Vec<u64> = env
             .storage().persistent().get(&ids_key)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         ids.push_back(transaction_id);
         env.storage().persistent().set(&ids_key, &ids);
         env.storage().persistent().extend_ttl(&ids_key, PERSISTENT_TTL, PERSISTENT_TTL);
@@ -4751,6 +5144,23 @@ impl AnchorKitContract {
     /// current [`SERVICE_CAPABILITY_VERSION`] (#239).
     fn is_known_service_code(code: u32) -> bool {
         code >= SERVICE_DEPOSITS && code <= MAX_KNOWN_SERVICE_CODE
+    }
+
+    /// Sort services in ascending order for deterministic storage.
+    /// This ensures consistent behavior regardless of submission order.
+    fn sort_services(_env: &Env, services: &mut Vec<u32>) {
+        // Simple bubble sort for small vectors (typically 1-4 elements)
+        let len = services.len();
+        for i in 0..len {
+            for j in 0..len - i - 1 {
+                let a = services.get(j).unwrap();
+                let b = services.get(j + 1).unwrap();
+                if a > b {
+                    services.set(j, b);
+                    services.set(j + 1, a);
+                }
+            }
+        }
     }
 
     /// Returns `true` iff `anchor` has configured services that include
@@ -5499,5 +5909,17 @@ impl AnchorKitContract {
             rate_limit_window_length: config.window_length,
             checked_at: now,
         }
+    }
+
+    /// Retrieve current replay detection metrics.
+    /// Returns aggregated statistics about detected replay attacks.
+    pub fn get_replay_metrics(env: Env) -> ReplayMetrics {
+        replay_detection::get_replay_metrics(&env)
+    }
+
+    /// Retrieve the attempt count for a specific request ID that was replayed.
+    /// Returns 0 if no replay attempts have been recorded for this ID.
+    pub fn get_replay_count_for_id(env: Env, request_id: Bytes) -> u64 {
+        replay_detection::get_replay_count_for_id(&env, &request_id)
     }
 }
