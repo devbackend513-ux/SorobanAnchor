@@ -10,35 +10,10 @@ use serde::Serialize;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 
-// ── SecretKey wrapper ──────────────────────────────────────────────────────────
-
-/// Opaque wrapper around a Stellar secret key string.
-/// Does not implement Debug or Display to prevent accidental logging.
-struct SecretKey(String);
-
-impl SecretKey {
-    fn new(s: impl Into<String>) -> Self {
-        SecretKey(s.into())
-    }
-}
-
-impl std::ops::Deref for SecretKey {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for SecretKey {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.as_ref()
-    }
-}
-
-// ── Secret key wrapper (zeroizing) ───────────────────────────────────────────
+// ── SecretKey wrapper ─────────────────────────────────────────────────────────
 //
-// Prevents accidental secret leakage through Debug/Display, and zeroizes the
-// key material when the value is dropped (post-use or on error paths).
+// Wraps a Stellar secret key so it is never accidentally emitted to stdout,
+// stderr, or debug output. Zeroizes key material on drop.
 
 struct SecretKey(String);
 
@@ -49,7 +24,7 @@ impl SecretKey {
 
 impl std::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SecretKey([REDACTED])")
+        f.write_str("[REDACTED]")
     }
 }
 
@@ -64,49 +39,14 @@ impl std::ops::Deref for SecretKey {
     fn deref(&self) -> &str { &self.0 }
 }
 
+impl AsRef<std::ffi::OsStr> for SecretKey {
+    fn as_ref(&self) -> &std::ffi::OsStr { self.0.as_ref() }
+}
+
 impl Drop for SecretKey {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.0.zeroize();
-    }
-}
-
-// ── SecretKey wrapper ─────────────────────────────────────────────────────────
-//
-// Wraps a Stellar secret key so it is never accidentally emitted to stdout,
-// stderr, or debug output. The underlying value is only exposed via `Deref`
-// (→ &str) and `AsRef<OsStr>` so it can be passed to subprocess arguments.
-
-struct SecretKey(String);
-
-impl SecretKey {
-    fn new(s: impl Into<String>) -> Self {
-        SecretKey(s.into())
-    }
-}
-
-impl std::ops::Deref for SecretKey {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for SecretKey {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.as_ref()
-    }
-}
-
-impl std::fmt::Debug for SecretKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[REDACTED]")
-    }
-}
-
-impl std::fmt::Display for SecretKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[REDACTED]")
     }
 }
 
@@ -405,49 +345,134 @@ fn require_contract_id(global: Option<String>, local: Option<String>, command: &
     })
 }
 
-/// Resolve the signing source from flags or environment.
-/// Priority: --secret-key > ANCHOR_ADMIN_SECRET > --keypair-file > --credential-name
-fn resolve_source(secret_key: Option<&str>, keypair_file: Option<&str>, credential_name: Option<&str>) -> SecretKey {
+/// Validate that `key` looks like a Stellar secret key (starts with 'S', non-empty).
+/// Returns an error string when the key is invalid.
+fn validate_stellar_secret(key: &str, source_label: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err(format!("{source_label}: signing key must not be empty"));
+    }
+    if !key.starts_with('S') {
+        return Err(format!(
+            "{source_label}: not a valid Stellar secret key (expected 'S...' format, got a key starting with '{}')",
+            key.chars().next().unwrap_or('?')
+        ));
+    }
+    Ok(())
+}
+
+/// Inner, infallible-return version of secret resolution used for unit testing.
+///
+/// Resolution order:
+///   1. `ephemeral_token` (highest priority; one-time automated flow token)
+///   2. `secret_key` flag
+///   3. `ANCHOR_ADMIN_SECRET` environment variable
+///   4. `keypair_file` (JSON `{"secret_key":"S..."}` or plain-text)
+///   5. `credential_name` (keystore; requires interactive prompt)
+///
+/// Returns `Ok(raw_key_string)` on success or `Err(descriptive_message)` on failure.
+fn try_resolve_source(
+    ephemeral_token: Option<&str>,
+    secret_key: Option<&str>,
+    keypair_file: Option<&str>,
+    credential_name: Option<&str>,
+    no_interactive: bool,
+    read_env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    // 1. Ephemeral token — highest priority, single-use automated token
+    if let Some(tok) = ephemeral_token {
+        if !tok.is_empty() {
+            validate_stellar_secret(tok, "--ephemeral-token / ANCHORKIT_EPHEMERAL_TOKEN")?;
+            return Ok(tok.to_string());
+        }
+    }
+
+    // 2. Explicit --secret-key flag
     if let Some(sk) = secret_key {
-        return SecretKey::new(sk);
+        validate_stellar_secret(sk, "--secret-key")?;
+        return Ok(sk.to_string());
     }
-    if let Ok(sk) = std::env::var("ANCHOR_ADMIN_SECRET") {
-        if !sk.is_empty() {
-            return SecretKey::new(sk);
+
+    // 3. ANCHOR_ADMIN_SECRET environment variable
+    if let Some(sk) = read_env("ANCHOR_ADMIN_SECRET") {
+        if sk.is_empty() {
+            return Err(
+                "ANCHOR_ADMIN_SECRET is set but empty — provide a valid Stellar secret key \
+                 (expected 'S...' format) or unset the variable"
+                    .to_string(),
+            );
         }
+        validate_stellar_secret(&sk, "ANCHOR_ADMIN_SECRET")?;
+        return Ok(sk);
     }
+
+    // 4. Keypair file
     if let Some(path) = keypair_file {
-        let raw = match secure_read_file(path) {
-            Ok(content) => content,
-            Err(e) => {
-                eprintln!("error: cannot read keypair file '{path}': {e}");
-                std::process::exit(1);
-            }
+        let raw = secure_read_file(path)
+            .map_err(|e| format!("cannot read keypair file '{path}': {e}"))?;
+        let key = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            v.get("secret_key")
+                .and_then(|s| s.as_str())
+                .unwrap_or_else(|| raw.trim())
+                .to_string()
+        } else {
+            raw.trim().to_string()
         };
-        // Support JSON {"secret_key":"S..."} or plain text.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(sk) = v.get("secret_key").and_then(|s| s.as_str()) {
-                return SecretKey::new(sk);
-            }
-        }
-        return SecretKey::new(raw.trim());
+        validate_stellar_secret(&key, &format!("keypair file '{path}'"))?;
+        return Ok(key);
     }
+
+    // 5. Keystore credential — requires interactive password prompt
     if let Some(name) = credential_name {
         if no_interactive {
-            eprintln!("error: --credential-name requires an interactive password prompt; \
-                       use --secret-key, --ephemeral-token, or ANCHOR_ADMIN_SECRET in non-interactive mode");
+            return Err(
+                "--credential-name requires an interactive password prompt; \
+                 use --secret-key, --ephemeral-token, or ANCHOR_ADMIN_SECRET in \
+                 non-interactive mode"
+                    .to_string(),
+            );
+        }
+        // Actual keystore decryption happens in the caller (requires rpassword).
+        return Err(format!("__keystore__{name}"));
+    }
+
+    Err("signing key required — provide one of:\n  \
+         --secret-key <KEY>\n  \
+         export ANCHOR_ADMIN_SECRET=<KEY>\n  \
+         --keypair-file <PATH>\n  \
+         --credential-name <NAME>  (use: anchorkit credentials add --name <NAME>)"
+        .to_string())
+}
+
+/// Resolve the signing source from flags or environment.
+/// Resolution order: ephemeral_token > --secret-key > ANCHOR_ADMIN_SECRET >
+///                   --keypair-file > --credential-name
+fn resolve_source(
+    ephemeral_token: Option<&str>,
+    secret_key: Option<&str>,
+    keypair_file: Option<&str>,
+    credential_name: Option<&str>,
+    no_interactive: bool,
+) -> SecretKey {
+    match try_resolve_source(
+        ephemeral_token,
+        secret_key,
+        keypair_file,
+        credential_name,
+        no_interactive,
+        &|var| std::env::var(var).ok(),
+    ) {
+        Ok(key) => SecretKey::new(key),
+        Err(msg) if msg.starts_with("__keystore__") => {
+            let name = &msg["__keystore__".len()..];
+            let password = rpassword::prompt_password("Keystore password: ")
+                .unwrap_or_else(|e| { eprintln!("error: failed to read password: {e}"); std::process::exit(1); });
+            keystore_get_decrypted(name, &password)
+        }
+        Err(msg) => {
+            eprintln!("error: {msg}");
             std::process::exit(1);
         }
-        let password = rpassword::prompt_password("Keystore password: ")
-            .unwrap_or_else(|e| { eprintln!("error: failed to read password: {e}"); std::process::exit(1); });
-        return SecretKey::new(keystore_get_decrypted(name, &password));
     }
-    eprintln!("error: signing key required — provide one of:");
-    eprintln!("  --secret-key <KEY>");
-    eprintln!("  export ANCHOR_ADMIN_SECRET=<KEY>");
-    eprintln!("  --keypair-file <PATH>");
-    eprintln!("  --credential-name <NAME>  (use: anchorkit credentials add --name <NAME>)");
-    std::process::exit(1);
 }
 
 fn normalize_stellar_public_address(field: &str, address: &str) -> String {
@@ -1809,6 +1834,8 @@ fn offline_simulate(config_path: Option<&str>, workflow: &str) {
 fn main() {
     let cli = Cli::parse();
     let global_contract_id = cli.contract_id.clone();
+    let no_interactive = cli.no_interactive;
+    let ephemeral_token = cli.ephemeral_token.clone();
     let network = cli.network.unwrap_or_else(|| {
         let n = default_network();
         if std::env::var("STELLAR_NETWORK").is_err() && !load_network_profiles().iter().any(|p| p.is_default) {
@@ -1821,7 +1848,10 @@ fn main() {
             let net = cmd_net;
             if upgrade {
                 let contract_id = require_contract_id(global_contract_id, None, "deploy --upgrade");
-                let signing_source = resolve_source(secret_key.as_deref(), keypair_file.as_deref(), None);
+                let signing_source = resolve_source(
+                    ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
+                    None, no_interactive,
+                );
                 upgrade_contract(&contract_id, &net, &signing_source);
             } else {
                 deploy(&net, &source, admin.as_deref(), dry_run, list);
@@ -1830,17 +1860,26 @@ fn main() {
         Commands::Register { address, services, contract_id, network: cmd_net, secret_key, keypair_file, credential_name, sep10_token, sep10_issuer } => {
             let cid = require_contract_id(global_contract_id, contract_id, "register");
             let net = cmd_net;
-            let source = resolve_source(secret_key.as_deref(), keypair_file.as_deref(), credential_name.as_deref());
+            let source = resolve_source(
+                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
+                credential_name.as_deref(), no_interactive,
+            );
             register(&address, &services, &cid, &net, &source, &sep10_token, &sep10_issuer);
         }
         Commands::Attest { subject, payload_hash, contract_id, network: cmd_net, secret_key, keypair_file, credential_name, issuer, session_id } => {
             let cid = require_contract_id(global_contract_id, contract_id, "attest");
-            let source = resolve_source(secret_key.as_deref(), keypair_file.as_deref(), credential_name.as_deref());
+            let source = resolve_source(
+                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
+                credential_name.as_deref(), no_interactive,
+            );
             attest(&subject, &payload_hash, &cid, &cmd_net, &source, &issuer, session_id);
         }
         Commands::Quote { from, to, amount, contract_id, network: cmd_net, secret_key, keypair_file, credential_name } => {
             let cid = require_contract_id(global_contract_id, contract_id, "quote");
-            let source = resolve_source(secret_key.as_deref(), keypair_file.as_deref(), credential_name.as_deref());
+            let source = resolve_source(
+                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
+                credential_name.as_deref(), no_interactive,
+            );
             quote(&from, &to, amount, &cid, &cmd_net, &source);
         }
         Commands::Status { tx_id, anchor_url, proxy_url, no_proxy } => {
@@ -1848,14 +1887,20 @@ fn main() {
         }
         Commands::Revoke { address, contract_id, network: cmd_net, secret_key, keypair_file, credential_name } => {
             let cid = require_contract_id(global_contract_id, contract_id, "revoke");
-            let source = resolve_source(secret_key.as_deref(), keypair_file.as_deref(), credential_name.as_deref());
+            let source = resolve_source(
+                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
+                credential_name.as_deref(), no_interactive,
+            );
             revoke(&address, &cid, &cmd_net, &source);
         }
         Commands::Doctor { fix } => {
             doctor(&network, fix);
         }
         Commands::Health { contract_id, network: cmd_net, secret_key, keypair_file, anchor, attestor } => {
-            let source = resolve_source(secret_key.as_deref(), keypair_file.as_deref(), None);
+            let source = resolve_source(
+                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
+                None, no_interactive,
+            );
             health_check(&contract_id, &cmd_net, &source, anchor.as_deref(), attestor.as_deref());
         }
         Commands::Network { action } => {
@@ -1899,6 +1944,113 @@ fn main() {
 }
 
 #[cfg(test)]
+mod secret_resolution_tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<String> { None }
+    fn env_with(key: &str, value: &str) -> impl Fn(&str) -> Option<String> + '_ {
+        move |k: &str| if k == key { Some(value.to_string()) } else { None }
+    }
+
+    const VALID_KEY: &str = "SCZANGBA5IIPMEFXBI5LZU7RVJZOLBYHJYFJ2KYN3CQPUOVFRDPCNTY";
+
+    #[test]
+    fn test_validate_stellar_secret_accepts_valid_key() {
+        assert!(validate_stellar_secret(VALID_KEY, "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_stellar_secret_rejects_empty() {
+        let err = validate_stellar_secret("", "test").unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_stellar_secret_rejects_non_s_prefix() {
+        let err = validate_stellar_secret("GABCDE123", "test").unwrap_err();
+        assert!(err.contains("'S...' format"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_uses_explicit_secret_key_first() {
+        let result = try_resolve_source(
+            None, Some(VALID_KEY), None, None, false,
+            &env_with("ANCHOR_ADMIN_SECRET", VALID_KEY),
+        );
+        assert_eq!(result.unwrap(), VALID_KEY);
+    }
+
+    #[test]
+    fn test_resolve_uses_ephemeral_token_over_secret_key() {
+        let result = try_resolve_source(
+            Some(VALID_KEY), Some("Sother"), None, None, false, &no_env,
+        );
+        assert_eq!(result.unwrap(), VALID_KEY);
+    }
+
+    #[test]
+    fn test_resolve_falls_back_to_env_var() {
+        let result = try_resolve_source(None, None, None, None, false, &env_with("ANCHOR_ADMIN_SECRET", VALID_KEY));
+        assert_eq!(result.unwrap(), VALID_KEY);
+    }
+
+    #[test]
+    fn test_resolve_errors_on_empty_env_var() {
+        let err = try_resolve_source(
+            None, None, None, None, false,
+            &env_with("ANCHOR_ADMIN_SECRET", ""),
+        )
+        .unwrap_err();
+        assert!(err.contains("empty"), "expected 'empty' in: {err}");
+    }
+
+    #[test]
+    fn test_resolve_errors_on_invalid_env_var_format() {
+        let err = try_resolve_source(
+            None, None, None, None, false,
+            &env_with("ANCHOR_ADMIN_SECRET", "GABCDE123"),
+        )
+        .unwrap_err();
+        assert!(err.contains("'S...' format"), "expected format error in: {err}");
+    }
+
+    #[test]
+    fn test_resolve_errors_when_no_source_provided() {
+        let err = try_resolve_source(None, None, None, None, false, &no_env).unwrap_err();
+        assert!(err.contains("signing key required"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_errors_on_credential_name_in_non_interactive_mode() {
+        let err = try_resolve_source(
+            None, None, None, Some("my-cred"), true, &no_env,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-interactive"), "got: {err}");
+    }
+
+    #[test]
+    fn test_secret_key_redacted_in_display() {
+        let sk = SecretKey::new(VALID_KEY);
+        assert_eq!(format!("{sk}"), "[REDACTED]");
+        assert_eq!(format!("{sk:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn test_secret_key_deref_exposes_value() {
+        let sk = SecretKey::new("STEST");
+        let s: &str = &sk;
+        assert_eq!(s, "STEST");
+    }
+
+    #[test]
+    fn test_secret_key_expose_method() {
+        let sk = SecretKey::new("STEST");
+        assert_eq!(sk.expose(), "STEST");
+    }
+}
+
+#[cfg(test)]
 mod offline_tests {
     use super::*;
 
@@ -1928,17 +2080,4 @@ mod offline_tests {
         assert!(!result, "invalid JSON should fail validation");
     }
 
-    #[test]
-    fn test_secret_key_is_redacted_in_display() {
-        let sk = SecretKey::new("SCZANGBA5IIPMEFXBI5LZU7RVJZOLBYHJYFJ2KYN3CQPUOVFRDPCNTY");
-        assert_eq!(format!("{sk}"), "[REDACTED]");
-        assert_eq!(format!("{sk:?}"), "[REDACTED]");
-    }
-
-    #[test]
-    fn test_secret_key_deref() {
-        let sk = SecretKey::new("STEST");
-        let s: &str = &sk;
-        assert_eq!(s, "STEST");
-    }
 }
