@@ -29,6 +29,11 @@ mod anchor_info_discovery_tests {
         });
     }
 
+    /// Empty source URI helper — used by tests that do not care about provenance.
+    fn no_uri(env: &Env) -> String {
+        String::from_str(env, "")
+    }
+
     fn usdc_asset(env: &Env) -> AssetInfo {
         AssetInfo {
             code: String::from_str(env, "USDC"),
@@ -73,12 +78,42 @@ mod anchor_info_discovery_tests {
 
         StellarToml {
             version: String::from_str(env, "2.0.0"),
-            network_passphrase: String::from_str(env, "Test SDF Network ; September 2015"),
+            network_passphrase: String::from_str(
+                env,
+                "Test SDF Network ; September 2015",
+            ),
             accounts,
             signing_key: String::from_str(env, "GSIGN123"),
             currencies,
             transfer_server: String::from_str(env, "https://api.example.com"),
-            transfer_server_sep0024: String::from_str(env, "https://api.example.com/sep24"),
+            transfer_server_sep0024: String::from_str(
+                env,
+                "https://api.example.com/sep24",
+            ),
+            kyc_server: String::from_str(env, "https://kyc.example.com"),
+            web_auth_endpoint: String::from_str(env, "https://auth.example.com"),
+        }
+    }
+
+    fn make_toml_with_asset(env: &Env, asset: AssetInfo) -> StellarToml {
+        let mut currencies = Vec::new(env);
+        currencies.push_back(asset);
+        let mut accounts = Vec::new(env);
+        accounts.push_back(String::from_str(env, "GANCHOR1"));
+        StellarToml {
+            version: String::from_str(env, "2.0.0"),
+            network_passphrase: String::from_str(
+                env,
+                "Test SDF Network ; September 2015",
+            ),
+            accounts,
+            signing_key: String::from_str(env, "GSIGN123"),
+            currencies,
+            transfer_server: String::from_str(env, "https://api.example.com"),
+            transfer_server_sep0024: String::from_str(
+                env,
+                "https://api.example.com/sep24",
+            ),
             kyc_server: String::from_str(env, "https://kyc.example.com"),
             web_auth_endpoint: String::from_str(env, "https://auth.example.com"),
         }
@@ -91,13 +126,17 @@ mod anchor_info_discovery_tests {
         (client, anchor)
     }
 
+    // -----------------------------------------------------------------------
+    // Basic cache tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_fetch_and_cache_toml() {
         let env = make_env();
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
         let toml = client.get_anchor_toml(&anchor);
         assert_eq!(toml.version, String::from_str(&env, "2.0.0"));
@@ -110,11 +149,17 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
         let toml = client.get_anchor_toml(&anchor);
-        assert_eq!(toml.network_passphrase, String::from_str(&env, "Test SDF Network ; September 2015"));
-        assert_eq!(toml.transfer_server, String::from_str(&env, "https://api.example.com"));
+        assert_eq!(
+            toml.network_passphrase,
+            String::from_str(&env, "Test SDF Network ; September 2015"),
+        );
+        assert_eq!(
+            toml.transfer_server,
+            String::from_str(&env, "https://api.example.com"),
+        );
     }
 
     #[test]
@@ -133,7 +178,7 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 1000);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &1u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &1u64, &no_uri(&env));
 
         set_ledger(&env, 1002);
         let result = client.try_get_anchor_toml(&anchor);
@@ -147,7 +192,7 @@ mod anchor_info_discovery_tests {
         let (client, anchor) = setup(&env);
 
         // Cache with 3600s TTL at timestamp 1000
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
         // At timestamp 5000: 1000 + 3600 = 4600 < 5000, so expired
         set_ledger(&env, 5000);
@@ -161,7 +206,7 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
         let assets = client.get_anchor_assets(&anchor);
         assert_eq!(assets.len(), 2);
@@ -175,7 +220,7 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
         let info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(info.issuer, String::from_str(&env, "GABC123"));
@@ -188,9 +233,10 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let result = client.try_get_anchor_asset_info(&anchor, &String::from_str(&env, "BTC"));
+        let result =
+            client.try_get_anchor_asset_info(&anchor, &String::from_str(&env, "BTC"));
         assert!(result.is_err());
     }
 
@@ -200,9 +246,10 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let (min, max) = client.get_anchor_deposit_limits(&anchor, &String::from_str(&env, "USDC"));
+        let (min, max) = client
+            .get_anchor_deposit_limits(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(min, 1000);
         assert_eq!(max, 1_000_000);
     }
@@ -213,9 +260,10 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let (min, max) = client.get_anchor_withdrawal_limits(&anchor, &String::from_str(&env, "USDC"));
+        let (min, max) = client
+            .get_anchor_withdrawal_limits(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(min, 500);
         assert_eq!(max, 500_000);
     }
@@ -226,9 +274,10 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let (fixed, percent) = client.get_anchor_deposit_fees(&anchor, &String::from_str(&env, "USDC"));
+        let (fixed, percent) = client
+            .get_anchor_deposit_fees(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(fixed, 100);
         assert_eq!(percent, 10);
     }
@@ -239,9 +288,10 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let (fixed, percent) = client.get_anchor_withdrawal_fees(&anchor, &String::from_str(&env, "USDC"));
+        let (fixed, percent) = client
+            .get_anchor_withdrawal_fees(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(fixed, 50);
         assert_eq!(percent, 5);
     }
@@ -252,9 +302,11 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        assert!(client.anchor_supports_deposits(&anchor, &String::from_str(&env, "USDC")));
+        assert!(
+            client.anchor_supports_deposits(&anchor, &String::from_str(&env, "USDC"))
+        );
     }
 
     #[test]
@@ -263,9 +315,11 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        assert!(client.anchor_supports_withdrawals(&anchor, &String::from_str(&env, "USDC")));
+        assert!(
+            client.anchor_supports_withdrawals(&anchor, &String::from_str(&env, "USDC"))
+        );
     }
 
     #[test]
@@ -274,7 +328,7 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
         let _ = client.get_anchor_toml(&anchor);
 
         client.refresh_anchor_info(&anchor);
@@ -282,8 +336,8 @@ mod anchor_info_discovery_tests {
         let toml = client.get_anchor_toml(&anchor);
         assert_eq!(toml.version, String::from_str(&env, "2.0.0"));
 
-        let diagnostic =
-            client.get_refresh_diagnostic(&anchor, &String::from_str(&env, "anchor_info"));
+        let diagnostic = client
+            .get_refresh_diagnostic(&anchor, &String::from_str(&env, "anchor_info"));
         assert_eq!(diagnostic.status, RefreshStatus::Failed);
         assert!(diagnostic.had_cached_entry);
     }
@@ -294,10 +348,12 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let usdc_info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "USDC"));
-        let xlm_info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "XLM"));
+        let usdc_info =
+            client.get_anchor_asset_info(&anchor, &String::from_str(&env, "USDC"));
+        let xlm_info =
+            client.get_anchor_asset_info(&anchor, &String::from_str(&env, "XLM"));
 
         assert_eq!(usdc_info.deposit_fee_fixed, 100);
         assert_eq!(xlm_info.deposit_fee_fixed, 0);
@@ -309,7 +365,7 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
         let info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "XLM"));
         assert_eq!(info.issuer, String::from_str(&env, "native"));
@@ -343,21 +399,29 @@ mod anchor_info_discovery_tests {
         accounts2.push_back(String::from_str(&env, "GANCHOR2"));
         let toml2 = StellarToml {
             version: String::from_str(&env, "2.0.0"),
-            network_passphrase: String::from_str(&env, "Test SDF Network ; September 2015"),
+            network_passphrase: String::from_str(
+                &env,
+                "Test SDF Network ; September 2015",
+            ),
             accounts: accounts2,
             signing_key: String::from_str(&env, "GSIGN456"),
             currencies: currencies2,
             transfer_server: String::from_str(&env, "https://api2.example.com"),
-            transfer_server_sep0024: String::from_str(&env, "https://api2.example.com/sep24"),
+            transfer_server_sep0024: String::from_str(
+                &env,
+                "https://api2.example.com/sep24",
+            ),
             kyc_server: String::from_str(&env, "https://kyc2.example.com"),
             web_auth_endpoint: String::from_str(&env, "https://auth2.example.com"),
         };
 
-        client.fetch_anchor_info(&anchor1, &sample_toml(&env), &3600u64);
-        client.fetch_anchor_info(&anchor2, &toml2, &3600u64);
+        client.fetch_anchor_info(&anchor1, &sample_toml(&env), &3600u64, &no_uri(&env));
+        client.fetch_anchor_info(&anchor2, &toml2, &3600u64, &no_uri(&env));
 
-        let info1 = client.get_anchor_asset_info(&anchor1, &String::from_str(&env, "USDC"));
-        let info2 = client.get_anchor_asset_info(&anchor2, &String::from_str(&env, "USDC"));
+        let info1 =
+            client.get_anchor_asset_info(&anchor1, &String::from_str(&env, "USDC"));
+        let info2 =
+            client.get_anchor_asset_info(&anchor2, &String::from_str(&env, "USDC"));
 
         assert_eq!(info1.issuer, String::from_str(&env, "GABC123"));
         assert_eq!(info2.issuer, String::from_str(&env, "GOTHER"));
@@ -371,10 +435,12 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let (dep_min, dep_max) = client.get_anchor_deposit_limits(&anchor, &String::from_str(&env, "USDC"));
-        let (wit_min, wit_max) = client.get_anchor_withdrawal_limits(&anchor, &String::from_str(&env, "USDC"));
+        let (dep_min, dep_max) = client
+            .get_anchor_deposit_limits(&anchor, &String::from_str(&env, "USDC"));
+        let (wit_min, wit_max) = client
+            .get_anchor_withdrawal_limits(&anchor, &String::from_str(&env, "USDC"));
 
         assert!(dep_min < dep_max);
         assert!(wit_min < wit_max);
@@ -390,10 +456,12 @@ mod anchor_info_discovery_tests {
         set_ledger(&env, 0);
         let (client, anchor) = setup(&env);
 
-        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64);
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
 
-        let (dep_fixed, dep_pct) = client.get_anchor_deposit_fees(&anchor, &String::from_str(&env, "USDC"));
-        let (wit_fixed, wit_pct) = client.get_anchor_withdrawal_fees(&anchor, &String::from_str(&env, "USDC"));
+        let (dep_fixed, dep_pct) = client
+            .get_anchor_deposit_fees(&anchor, &String::from_str(&env, "USDC"));
+        let (wit_fixed, wit_pct) = client
+            .get_anchor_withdrawal_fees(&anchor, &String::from_str(&env, "USDC"));
 
         assert_eq!(dep_fixed, 100);
         assert_eq!(dep_pct, 10);
@@ -404,24 +472,6 @@ mod anchor_info_discovery_tests {
     // -----------------------------------------------------------------------
     // #245 — fee and limit validation tests
     // -----------------------------------------------------------------------
-
-    fn make_toml_with_asset(env: &Env, asset: AssetInfo) -> StellarToml {
-        let mut currencies = Vec::new(env);
-        currencies.push_back(asset);
-        let mut accounts = Vec::new(env);
-        accounts.push_back(String::from_str(env, "GANCHOR1"));
-        StellarToml {
-            version: String::from_str(env, "2.0.0"),
-            network_passphrase: String::from_str(env, "Test SDF Network ; September 2015"),
-            accounts,
-            signing_key: String::from_str(env, "GSIGN123"),
-            currencies,
-            transfer_server: String::from_str(env, "https://api.example.com"),
-            transfer_server_sep0024: String::from_str(env, "https://api.example.com/sep24"),
-            kyc_server: String::from_str(env, "https://kyc.example.com"),
-            web_auth_endpoint: String::from_str(env, "https://auth.example.com"),
-        }
-    }
 
     /// deposit_fee_percent > 10_000 bps must be rejected.
     #[test]
@@ -445,7 +495,12 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 0,
             withdrawal_max_amount: 0,
         };
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64);
+        client.fetch_anchor_info(
+            &anchor,
+            &make_toml_with_asset(&env, bad_asset),
+            &3600u64,
+            &no_uri(&env),
+        );
     }
 
     /// withdrawal_fee_percent > 10_000 bps must be rejected.
@@ -470,7 +525,12 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 100,
             withdrawal_max_amount: 1_000,
         };
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64);
+        client.fetch_anchor_info(
+            &anchor,
+            &make_toml_with_asset(&env, bad_asset),
+            &3600u64,
+            &no_uri(&env),
+        );
     }
 
     /// deposit_min_amount > deposit_max_amount (inverted range) must be rejected.
@@ -495,7 +555,12 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 0,
             withdrawal_max_amount: 0,
         };
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64);
+        client.fetch_anchor_info(
+            &anchor,
+            &make_toml_with_asset(&env, bad_asset),
+            &3600u64,
+            &no_uri(&env),
+        );
     }
 
     /// withdrawal_min_amount > withdrawal_max_amount must be rejected.
@@ -520,7 +585,12 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 9_000,
             withdrawal_max_amount: 1_000, // min > max
         };
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64);
+        client.fetch_anchor_info(
+            &anchor,
+            &make_toml_with_asset(&env, bad_asset),
+            &3600u64,
+            &no_uri(&env),
+        );
     }
 
     /// Empty currency code must be rejected.
@@ -545,7 +615,12 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 0,
             withdrawal_max_amount: 0,
         };
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64);
+        client.fetch_anchor_info(
+            &anchor,
+            &make_toml_with_asset(&env, bad_asset),
+            &3600u64,
+            &no_uri(&env),
+        );
     }
 
     /// Currency code longer than 12 characters must be rejected.
@@ -570,10 +645,15 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 0,
             withdrawal_max_amount: 0,
         };
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64);
+        client.fetch_anchor_info(
+            &anchor,
+            &make_toml_with_asset(&env, bad_asset),
+            &3600u64,
+            &no_uri(&env),
+        );
     }
 
-    /// max_amount = 0 is treated as "unlimited" and must not trigger the inverted-range check.
+    /// max_amount = 0 is treated as "unlimited"; must not trigger inverted-range check.
     #[test]
     fn test_zero_max_amount_is_valid() {
         let env = make_env();
@@ -595,8 +675,178 @@ mod anchor_info_discovery_tests {
             withdrawal_max_amount: 0, // 0 = unlimited
         };
         // Must not panic
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, asset), &3600u64);
-        let info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "USDC"));
+        client.fetch_anchor_info(
+            &anchor,
+            &make_toml_with_asset(&env, asset),
+            &3600u64,
+            &no_uri(&env),
+        );
+        let info =
+            client.get_anchor_asset_info(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(info.deposit_max_amount, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Provenance & freshness tests
+    // -----------------------------------------------------------------------
+
+    /// `get_anchor_toml_provenance` returns the source URI passed to `fetch_anchor_info`.
+    #[test]
+    fn test_provenance_source_uri_stored() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, anchor) = setup(&env);
+
+        let uri =
+            String::from_str(&env, "https://anchor.example/.well-known/stellar.toml");
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &uri);
+
+        let prov = client.get_anchor_toml_provenance(&anchor);
+        assert_eq!(prov.source_uri, uri);
+    }
+
+    /// When no source URI is provided the field is stored as an empty string.
+    #[test]
+    fn test_provenance_empty_source_uri() {
+        let env = make_env();
+        set_ledger(&env, 0);
+        let (client, anchor) = setup(&env);
+
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
+
+        let prov = client.get_anchor_toml_provenance(&anchor);
+        assert_eq!(prov.source_uri, String::from_str(&env, ""));
+    }
+
+    /// `cached_at` and `last_refreshed_at` are both equal to the ledger
+    /// timestamp on first write.
+    #[test]
+    fn test_provenance_cached_at_equals_last_refreshed_on_first_write() {
+        let env = make_env();
+        set_ledger(&env, 5000);
+        let (client, anchor) = setup(&env);
+
+        let uri =
+            String::from_str(&env, "https://anchor.example/.well-known/stellar.toml");
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &uri);
+
+        let prov = client.get_anchor_toml_provenance(&anchor);
+        assert_eq!(prov.cached_at, 5000);
+        assert_eq!(prov.last_refreshed_at, 5000);
+    }
+
+    /// `ttl_seconds` is stored and returned verbatim.
+    #[test]
+    fn test_provenance_ttl_seconds_stored() {
+        let env = make_env();
+        set_ledger(&env, 0);
+        let (client, anchor) = setup(&env);
+
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &7200u64, &no_uri(&env));
+
+        let prov = client.get_anchor_toml_provenance(&anchor);
+        assert_eq!(prov.ttl_seconds, 7200);
+    }
+
+    /// `age_seconds` reflects elapsed time since `cached_at`.
+    #[test]
+    fn test_provenance_age_seconds() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, anchor) = setup(&env);
+
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &no_uri(&env));
+
+        set_ledger(&env, 1500); // advance 500 seconds
+        let prov = client.get_anchor_toml_provenance(&anchor);
+        assert_eq!(prov.age_seconds, 500);
+    }
+
+    /// `get_anchor_toml_provenance` panics with `CacheNotFound` when no entry exists.
+    #[test]
+    #[should_panic]
+    fn test_provenance_not_found_panics() {
+        let env = make_env();
+        set_ledger(&env, 0);
+        let (client, anchor) = setup(&env);
+        // Never cached — must panic
+        client.get_anchor_toml_provenance(&anchor);
+    }
+
+    /// `get_anchor_toml_provenance` panics with `CacheExpired` after TTL elapses.
+    #[test]
+    #[should_panic]
+    fn test_provenance_expired_panics() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, anchor) = setup(&env);
+
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &10u64, &no_uri(&env));
+
+        set_ledger(&env, 1011); // past TTL
+        client.get_anchor_toml_provenance(&anchor);
+    }
+
+    /// A second `fetch_anchor_info` overwrites `source_uri`, `cached_at`, and
+    /// `last_refreshed_at` with the new values.
+    #[test]
+    fn test_provenance_overwrite_updates_all_fields() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, anchor) = setup(&env);
+
+        let uri1 = String::from_str(&env, "https://v1.example/stellar.toml");
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &uri1);
+
+        set_ledger(&env, 2000);
+        let uri2 = String::from_str(&env, "https://v2.example/stellar.toml");
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &uri2);
+
+        let prov = client.get_anchor_toml_provenance(&anchor);
+        assert_eq!(prov.source_uri, uri2);
+        assert_eq!(prov.cached_at, 2000);
+        assert_eq!(prov.last_refreshed_at, 2000);
+    }
+
+    /// The anchor address embedded in the provenance record matches the key anchor.
+    #[test]
+    fn test_provenance_anchor_field_matches() {
+        let env = make_env();
+        set_ledger(&env, 0);
+        let (client, anchor) = setup(&env);
+
+        let uri =
+            String::from_str(&env, "https://anchor.example/.well-known/stellar.toml");
+        client.fetch_anchor_info(&anchor, &sample_toml(&env), &3600u64, &uri);
+
+        let prov = client.get_anchor_toml_provenance(&anchor);
+        assert_eq!(prov.anchor, anchor);
+    }
+
+    /// Two different anchors maintain independent provenance records.
+    #[test]
+    fn test_provenance_independent_per_anchor() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, anchor1) = setup(&env);
+        let anchor2 = Address::generate(&env);
+
+        let uri1 = String::from_str(&env, "https://anchor1.example/stellar.toml");
+        let uri2 = String::from_str(&env, "https://anchor2.example/stellar.toml");
+        client.fetch_anchor_info(&anchor1, &sample_toml(&env), &3600u64, &uri1);
+
+        set_ledger(&env, 2000);
+        client.fetch_anchor_info(&anchor2, &sample_toml(&env), &7200u64, &uri2);
+
+        let prov1 = client.get_anchor_toml_provenance(&anchor1);
+        let prov2 = client.get_anchor_toml_provenance(&anchor2);
+
+        assert_eq!(prov1.source_uri, uri1);
+        assert_eq!(prov1.cached_at, 1000);
+        assert_eq!(prov1.ttl_seconds, 3600);
+
+        assert_eq!(prov2.source_uri, uri2);
+        assert_eq!(prov2.cached_at, 2000);
+        assert_eq!(prov2.ttl_seconds, 7200);
     }
 }

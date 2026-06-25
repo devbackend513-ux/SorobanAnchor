@@ -573,6 +573,34 @@ pub struct CachedToml {
     pub toml: StellarToml,
     pub cached_at: u64,
     pub ttl_seconds: u64,
+    /// URI from which this TOML data was sourced (e.g. the stellar.toml URL).
+    /// Set by the caller via `fetch_anchor_info`; empty when not provided.
+    pub source_uri: String,
+    /// Ledger timestamp when the entry was last successfully refreshed.
+    /// Equals `cached_at` on first write; updated on each successful refresh.
+    pub last_refreshed_at: u64,
+}
+
+/// Provenance metadata for a cached anchor TOML entry.
+///
+/// Returned by [`AnchorKitContract::get_anchor_toml_provenance`] so callers
+/// can verify where anchor metadata came from and how fresh it is without
+/// needing to decode the full cached entry.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorTomlProvenance {
+    /// The anchor address this provenance record belongs to.
+    pub anchor: Address,
+    /// URI from which the TOML data was fetched (empty if not provided).
+    pub source_uri: String,
+    /// Ledger timestamp when the entry was first stored (`cached_at`).
+    pub cached_at: u64,
+    /// Ledger timestamp of the most recent successful refresh.
+    pub last_refreshed_at: u64,
+    /// Configured lifetime of the entry in seconds.
+    pub ttl_seconds: u64,
+    /// Age of the cached entry in seconds (relative to current ledger time).
+    pub age_seconds: u64,
 }
 
 const MIN_TEMP_TTL: u32 = 15; // min_temp_entry_ttl - 1
@@ -2848,40 +2876,58 @@ impl AnchorKitContract {
         payload_hash: Bytes,
         signature: Bytes,
     ) -> u64 {
+        // --- Phase 1: authentication & read-only precondition checks ---
+        // All checks that do NOT write to storage run first. If any fails the
+        // function panics before any storage mutation occurs, leaving the
+        // contract in a consistent state.
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
         Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
-        Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
-        let config = RateLimiter::get_config(&env);
-        if RateLimiter::check_and_increment(&env, &issuer, &config).is_err() {
-            panic_with_error!(&env, ErrorCode::RateLimitExceeded);
-        }
-
+        // Replay check (read-only)
         let issuer_xdr = issuer.clone().to_xdr(&env);
         let issuer_raw = xdr_to_vec(&issuer_xdr);
         let hash_raw = xdr_to_vec(&payload_hash);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
             // Record replay detection event and metrics before panicking
-            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            let replay_event =
+                replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
             replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
+        // Rate-limit check: `enforce_rate_limit` calls `check_and_increment`
+        // which also writes. It comes last among the precondition checks so the
+        // counter is only incremented when every guard has already passed.
+        Self::enforce_rate_limit(&env, &issuer);
+
+        // --- Phase 2: all writes together ---
+        // We reach here only when every precondition is satisfied. Any
+        // out-of-storage budget failure below will abort the entire transaction
+        // and roll back the rate-limit increment along with every other write.
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env, id, issuer.clone(), subject.clone(), timestamp,
-            payload_hash.clone(), signature,
+            &env,
+            id,
+            issuer.clone(),
+            subject.clone(),
+            timestamp,
+            payload_hash.clone(),
+            signature,
         );
-
         env.storage().persistent().set(&used_key, &timestamp);
-        env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
+        env.storage()
+            .persistent()
+            .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
         env.events().publish(
             (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
-            AttestEvent { payload_hash, timestamp },
+            AttestEvent {
+                payload_hash,
+                timestamp,
+            },
         );
         id
     }
@@ -2899,6 +2945,7 @@ impl AnchorKitContract {
         signature: Bytes,
         require_kyc: bool,
     ) -> u64 {
+        // --- Phase 1: authentication & read-only precondition checks ---
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
         Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
@@ -2908,45 +2955,61 @@ impl AnchorKitContract {
             let kyc_status = Self::get_kyc_status(env.clone(), subject.clone());
             if kyc_status != KycStatus::Approved {
                 match kyc_status {
-                    KycStatus::Pending    => panic_with_error!(&env, ErrorCode::KycPending),
-                    KycStatus::Rejected   => panic_with_error!(&env, ErrorCode::KycRejected),
-                    KycStatus::Expired    => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::Pending => panic_with_error!(&env, ErrorCode::KycPending),
+                    KycStatus::Rejected => panic_with_error!(&env, ErrorCode::KycRejected),
+                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                     KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
                     _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                 }
             }
         }
 
+        // Replay check (read-only)
         let issuer_xdr = issuer.clone().to_xdr(&env);
         let issuer_raw = xdr_to_vec(&issuer_xdr);
         let hash_raw = xdr_to_vec(&payload_hash);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
-            // Record replay detection event and metrics before panicking
-            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            let replay_event =
+                replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
             replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
+        // Rate-limit check (single call; the earlier double-count was a bug).
+        Self::enforce_rate_limit(&env, &issuer);
+
+        // --- Phase 2: all writes together ---
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env, id, issuer.clone(), subject.clone(), timestamp,
-            payload_hash.clone(), signature,
+            &env,
+            id,
+            issuer.clone(),
+            subject.clone(),
+            timestamp,
+            payload_hash.clone(),
+            signature,
         );
-
         env.storage().persistent().set(&used_key, &timestamp);
-        env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
+        env.storage()
+            .persistent()
+            .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
         let _now = env.ledger().timestamp();
         env.events().publish(
             (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
-            AttestEvent { payload_hash: payload_hash.clone(), timestamp },
+            AttestEvent {
+                payload_hash: payload_hash.clone(),
+                timestamp,
+            },
         );
         env.events().publish(
             (symbol_short!("webhook"), symbol_short!("event")),
             WebhookEvent {
                 event_type: String::from_str(&env, "attestation_submitted"),
-                transaction_id: id, timestamp, payload_hash,
+                transaction_id: id,
+                timestamp,
+                payload_hash,
             },
         );
         id
@@ -5129,11 +5192,22 @@ impl AnchorKitContract {
     // Anchor Info Discovery
     // -----------------------------------------------------------------------
 
+    /// Cache the anchor's stellar.toml data along with provenance information.
+    ///
+    /// # Arguments
+    ///
+    /// * `anchor` - The anchor whose metadata is being cached.
+    /// * `toml_data` - Parsed stellar.toml payload.
+    /// * `ttl_seconds` - How long (in seconds) the entry is considered fresh.
+    ///   Pass `0` to use the contract-level `capabilities_ttl_seconds`.
+    /// * `source_uri` - The URL from which `toml_data` was fetched. Pass an
+    ///   empty string if the source is unknown or not applicable.
     pub fn fetch_anchor_info(
         env: Env,
         anchor: Address,
         toml_data: StellarToml,
         ttl_seconds: u64,
+        source_uri: String,
     ) {
         anchor.require_auth();
         for asset in toml_data.currencies.iter() {
@@ -5146,22 +5220,60 @@ impl AnchorKitContract {
             toml: toml_data,
             cached_at: now,
             ttl_seconds: ttl,
+            source_uri,
+            last_refreshed_at: now,
         };
         let key = (symbol_short!("TOMLCACHE"), anchor.clone());
-        let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL { ttl as u32 } else { MIN_TEMP_TTL };
+        let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL {
+            ttl as u32
+        } else {
+            MIN_TEMP_TTL
+        };
         env.storage().temporary().set(&key, &cached);
-        env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, ledger_ttl, ledger_ttl);
     }
 
     pub fn get_anchor_toml(env: Env, anchor: Address) -> StellarToml {
         let key = (symbol_short!("TOMLCACHE"), anchor);
-        let cached: CachedToml = env.storage().temporary().get(&key)
+        let cached: CachedToml = env
+            .storage()
+            .temporary()
+            .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::CacheNotFound));
         let now = env.ledger().timestamp();
         if cached.cached_at + cached.ttl_seconds <= now {
             panic_with_error!(&env, ErrorCode::CacheExpired);
         }
         cached.toml
+    }
+
+    /// Return provenance metadata for the anchor's cached stellar.toml entry.
+    ///
+    /// Panics with `CacheNotFound` when no entry exists, or `CacheExpired`
+    /// when the entry has passed its TTL. Callers should check freshness
+    /// first, or use `try_get_anchor_toml_provenance` via the SDK client.
+    pub fn get_anchor_toml_provenance(env: Env, anchor: Address) -> AnchorTomlProvenance {
+        let key = (symbol_short!("TOMLCACHE"), anchor.clone());
+        let cached: CachedToml = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::CacheNotFound));
+        let now = env.ledger().timestamp();
+        if cached.cached_at + cached.ttl_seconds <= now {
+            panic_with_error!(&env, ErrorCode::CacheExpired);
+        }
+        let age_seconds = now.saturating_sub(cached.cached_at);
+        AnchorTomlProvenance {
+            anchor,
+            source_uri: cached.source_uri,
+            cached_at: cached.cached_at,
+            last_refreshed_at: cached.last_refreshed_at,
+            ttl_seconds: cached.ttl_seconds,
+            age_seconds,
+        }
     }
 
     pub fn refresh_anchor_info(env: Env, anchor: Address) {
