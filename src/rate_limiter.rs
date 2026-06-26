@@ -123,7 +123,11 @@ impl RateLimiter {
             });
         
         // Check if window has expired and reset if needed
-        if Self::is_window_expired(current_ledger, state.window_start_ledger, config.window_length) {
+        if Self::is_window_expired(
+            current_ledger,
+            state.window_start_ledger,
+            config.window_length,
+        ) {
             state = RateLimitState {
                 submission_count: 0,
                 window_start_ledger: current_ledger,
@@ -248,9 +252,35 @@ impl RateLimiter {
             })
     }
     
-    /// Check if a window has expired
-    fn is_window_expired(current_ledger: u32, window_start_ledger: u32, window_length: u32) -> bool {
-        current_ledger.saturating_sub(window_start_ledger) >= window_length
+    /// Check if a rate-limit window has expired.
+    ///
+    /// Uses `checked_sub` instead of `saturating_sub` so that a sequence
+    /// anomaly where `current < window_start` (e.g. due to a ledger rollback
+    /// or corrupted stored state) is treated as **not expired** rather than
+    /// silently wrapping to 0 and comparing against `window_length`.
+    ///
+    /// # Safe-default rationale
+    ///
+    /// When `current_ledger < window_start_ledger` the subtraction overflows.
+    /// Saturating to 0 makes the condition `0 >= window_length` false for any
+    /// positive `window_length`, so the old behaviour was accidentally correct.
+    /// Using `checked_sub` makes the intent explicit: we detect the underflow
+    /// and deliberately return `false` (window not expired), preserving the
+    /// existing rate-limit state so an attestor cannot exploit the anomaly to
+    /// bypass their quota.
+    fn is_window_expired(
+        current_ledger: u32,
+        window_start_ledger: u32,
+        window_length: u32,
+    ) -> bool {
+        match current_ledger.checked_sub(window_start_ledger) {
+            Some(delta) => delta >= window_length,
+            // current < window_start: ledger sequence anomaly or stored-state
+            // inconsistency. Treat as window not yet expired so the existing
+            // submission count is preserved and the attestor cannot exploit
+            // the anomaly to bypass their rate limit.
+            None => false,
+        }
     }
     
     /// Generate collision-resistant storage key for per-attestor rate limit state.
@@ -597,6 +627,29 @@ mod tests {
         assert!(env.as_contract(&contract_id, &|| {
             RateLimiter::check_and_increment(&env, &attestor, &config)
         }).is_ok());
+    }
+
+    /// If the stored window_start_ledger is somehow *ahead* of the current ledger
+    /// (sequence anomaly), the window must be treated as NOT expired so that the
+    /// existing submission count is preserved and the rate-limit cannot be bypassed.
+    #[test]
+    fn test_window_not_expired_when_current_less_than_start() {
+        // current < window_start → checked_sub underflows → None → false
+        assert!(!RateLimiter::is_window_expired(5, 10, 10));
+        assert!(!RateLimiter::is_window_expired(0, 1, 1));
+        assert!(!RateLimiter::is_window_expired(100, 200, 50));
+    }
+
+    /// current == window_start and window_length > 0: delta is 0, so NOT expired.
+    #[test]
+    fn test_window_not_expired_at_exact_start() {
+        assert!(!RateLimiter::is_window_expired(10, 10, 1));
+    }
+
+    /// Verify the boundary: delta == window_length means expired.
+    #[test]
+    fn test_window_expired_at_exact_length() {
+        assert!(RateLimiter::is_window_expired(20, 10, 10)); // delta = 10 >= 10
     }
 
     #[test]
