@@ -6184,39 +6184,50 @@ impl AnchorKitContract {
     /// a registered attestor.
     /// Panics with [`ErrorCode::InvalidEndpointFormat`] when `endpoint` fails
     /// HTTPS domain validation.
-    pub fn register_endpoint_proof(
-        env: Env,
-        anchor: Address,
-        endpoint: String,
-        proof_hash: BytesN<32>,
-    ) {
-        anchor.require_auth();
-        Self::check_attestor(&env, &anchor);
+   pub fn register_endpoint_proof(
+    env: Env,
+    anchor: Address,
+    endpoint: String,
+    proof_hash: BytesN<32>,
+) {
+    anchor.require_auth();
+    Self::check_attestor(&env, &anchor);
 
-        // Validate the endpoint URL before storing.
-        let endpoint_str = Self::soroban_string_to_rust_string(&env, &endpoint);
-        crate::validate_anchor_domain(&endpoint_str)
-            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
+    // Validate the endpoint URL before storing.
+    let endpoint_str = Self::soroban_string_to_rust_string(&env, &endpoint);
+    crate::validate_anchor_domain(&endpoint_str)
+        .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
 
-        let now = env.ledger().timestamp();
-        let record = AnchorProofRecord {
-            anchor: anchor.clone(),
-            endpoint,
-            proof_hash,
-            registered_at: now,
-            verified: false,
-        };
-        let key = Self::pop_key(&env, &anchor);
-        env.storage().persistent().set(&key, &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+    // SECURITY FIX (#420):
+    // Ensure the proof is registered for the same endpoint configured
+    // in the attestor profile via set_endpoint(), when an endpoint has
+    // already been configured.
+    let profile = Self::load_or_init_profile(&env, &anchor);
 
-        env.events().publish(
-            (symbol_short!("pop"), symbol_short!("register"), anchor),
-            now,
-        );
+    if profile.endpoint.len() != 0 && profile.endpoint != endpoint {
+        panic_with_error!(&env, ErrorCode::ValidationError);
     }
+
+    let now = env.ledger().timestamp();
+    let record = AnchorProofRecord {
+        anchor: anchor.clone(),
+        endpoint,
+        proof_hash,
+        registered_at: now,
+        verified: false,
+    };
+
+    let key = Self::pop_key(&env, &anchor);
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+    env.events().publish(
+        (symbol_short!("pop"), symbol_short!("register"), anchor),
+        now,
+    );
+}
 
     /// Verify a proof-of-possession by comparing `proof_hash` against the
     /// stored record for `anchor`.
