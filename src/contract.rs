@@ -3650,7 +3650,7 @@ impl AnchorKitContract {
             .storage()
             .persistent()
             .get(&sess_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::SessionNotFound));
         Self::validate_session(&env, &session);
         session.closed = true;
         env.storage().persistent().set(&sess_key, &session);
@@ -3667,7 +3667,7 @@ impl AnchorKitContract {
             .storage()
             .persistent()
             .get(&sess_key)
-            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::SessionNotFound));
         Self::validate_session(env, &session);
         // #232: enforce per-session operation limit
         let op_count: u64 = env
@@ -3809,7 +3809,7 @@ impl AnchorKitContract {
         let anchor_raw = xdr_to_vec(&anchor_xdr);
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         let quote: Quote = env.storage().persistent().get(&q_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound));
         env.events().publish(
             (symbol_short!("quote"), symbol_short!("received"), quote_id),
             QuoteReceivedEvent { quote_id, receiver, timestamp: env.ledger().timestamp() },
@@ -3851,7 +3851,7 @@ impl AnchorKitContract {
         let anchor_raw = xdr_to_vec(&anchor_xdr);
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         let quote: Quote = env.storage().persistent().get(&q_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound));
 
         // #297: Enforce compliance gating if required
         if require_compliance {
@@ -3929,7 +3929,7 @@ impl AnchorKitContract {
         let sess_key = make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]);
         let mut session: Session = env
             .storage().persistent().get(&sess_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::SessionNotFound));
         session.nonce += 1;
         env.storage().persistent().set(&sess_key, &session);
         env.storage().persistent().extend_ttl(&sess_key, PERSISTENT_TTL, PERSISTENT_TTL);
@@ -4093,7 +4093,7 @@ impl AnchorKitContract {
         env.storage()
             .persistent()
             .get::<_, Session>(&make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]))
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound))
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::SessionNotFound))
     }
 
     pub fn get_audit_log(env: Env, log_id: u64) -> AuditLog {
@@ -4537,7 +4537,7 @@ impl AnchorKitContract {
         let anchor_raw = xdr_to_vec(&anchor_xdr);
         let key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         env.storage().persistent().get::<_, Quote>(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::NoQuotesAvailable))
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound))
     }
 
     pub fn set_anchor_metadata(
