@@ -1148,7 +1148,7 @@ fn anchor_cluster_list_key(env: &Env) -> BytesN<32> {
 fn xdr_to_vec(b: &Bytes) -> alloc::vec::Vec<u8> {
     let mut v = alloc::vec::Vec::with_capacity(b.len() as usize);
     for i in 0..b.len() {
-        v.push(b.get(i).unwrap_or(0));
+        v.push(b.get(i).expect("xdr_to_vec: index out of range"));
     }
     v
 }
@@ -3771,51 +3771,11 @@ impl AnchorKitContract {
         maximum_amount: u64,
         valid_until: u64,
     ) -> u64 {
-        anchor.require_auth();
-        validate_currency_code(&env, &base_asset);
-        validate_currency_code(&env, &quote_asset);
-        validate_fee_percent(&env, fee_percentage);
-        validate_amount_limits(&env, minimum_amount, maximum_amount);
-
-        // Reject quotes that are already expired or set in the past.
-        let now = env.ledger().timestamp();
-        if valid_until <= now {
-            panic_with_error!(&env, ErrorCode::InvalidQuote);
-        }
-        // Reject quotes expiring more than 30 days in the future to prevent
-        // unbounded validity windows that make routing unpredictable.
-        const MAX_QUOTE_VALIDITY: u64 = 30 * 24 * 60 * 60;
-        if valid_until.saturating_sub(now) > MAX_QUOTE_VALIDITY {
-            panic_with_error!(&env, ErrorCode::InvalidQuote);
-        }
-        let inst = env.storage().instance();
-        let qcnt_key = make_storage_key(&env, &[b"QCNT"]);
-        let next: u64 = inst.get(&qcnt_key).unwrap_or(0u64) + 1;
-        inst.set(&qcnt_key, &next);
-        inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
-
-        let anchor_xdr = anchor.clone().to_xdr(&env);
-        let anchor_raw = xdr_to_vec(&anchor_xdr);
-        let quote = Quote {
-            quote_id: next, anchor: anchor.clone(),
-            base_asset: base_asset.clone(), quote_asset: quote_asset.clone(),
-            rate, fee_percentage, minimum_amount, maximum_amount, valid_until,
-            schema_version: SCHEMA_V1,
-            routing_reason: None,
-        };
-        let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &next.to_be_bytes()]);
-        env.storage().persistent().set(&q_key, &quote);
-        env.storage().persistent().extend_ttl(&q_key, PERSISTENT_TTL, PERSISTENT_TTL);
-
-        let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
-        env.storage().persistent().set(&lq_key, &next);
-        env.storage().persistent().extend_ttl(&lq_key, PERSISTENT_TTL, PERSISTENT_TTL);
-
-        env.events().publish(
-            (symbol_short!("quote"), symbol_short!("submit"), next),
-            QuoteSubmitEvent { quote_id: next, anchor, base_asset, quote_asset, rate, valid_until, routing_reason: None },
-        );
-        next
+        Self::submit_quote_with_reason(
+            env, anchor, base_asset, quote_asset,
+            rate, fee_percentage, minimum_amount, maximum_amount,
+            valid_until, None,
+        )
     }
 
     /// Submit a quote with optional routing reason metadata (#298).
@@ -4261,7 +4221,7 @@ impl AnchorKitContract {
         let acnt_key = make_storage_key(&env, &[b"ACNT"]);
         let total: u64 = env.storage().instance().get::<_, u64>(&acnt_key).unwrap_or(0u64);
         let effective_limit = limit.min(50);
-        let end = (offset + effective_limit).min(total);
+        let end = offset.saturating_add(effective_limit).min(total);
         let mut results = Vec::new(&env);
         for i in offset..end {
             let audit_key = make_storage_key(&env, &[b"AUDIT", &i.to_be_bytes()]);
@@ -4286,7 +4246,7 @@ impl AnchorKitContract {
             .get(&make_storage_key(&env, &[b"SOPCNT", &session_id.to_be_bytes()]))
             .unwrap_or(0u64);
         let effective_limit = limit.min(50);
-        let end = (offset + effective_limit).min(total);
+        let end = offset.saturating_add(effective_limit).min(total);
         let mut results = Vec::new(&env);
         for i in offset..end {
             let slog_key = make_storage_key(&env, &[b"SLOG", &session_id.to_be_bytes(), &i.to_be_bytes()]);
