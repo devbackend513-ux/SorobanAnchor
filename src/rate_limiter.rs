@@ -194,7 +194,7 @@ impl RateLimiter {
         let stored_admin: Address = env
             .storage()
             .instance()
-            .get::<_, Address>(&soroban_sdk::vec![env, soroban_sdk::symbol_short!("ADMIN")])
+            .get::<_, Address>(&make_storage_key(env, &[b"ADMIN"]))
             .ok_or_else(AnchorKitError::not_initialized)?;
         if *admin != stored_admin {
             return Err(AnchorKitError::unauthorized_attestor());
@@ -418,7 +418,7 @@ mod tests {
     }
     
     #[test]
-    fn test_rate_limit_config_update() {
+    fn test_rate_limit_config_update_uses_contract_admin_key() {
         let env = Env::default();
         env.mock_all_auths();
         let admin = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
@@ -430,11 +430,11 @@ mod tests {
         let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
         let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
 
-        // Store admin in instance storage before calling update_config
+        // Mirror AnchorKitContract::initialize by using the deterministic admin key.
         env.as_contract(&contract_id, &|| {
             env.storage()
                 .instance()
-                .set(&soroban_sdk::vec![&env, soroban_sdk::symbol_short!("ADMIN")], &admin);
+                .set(&make_storage_key(&env, &[b"ADMIN"]), &admin);
         });
 
         let result = env.as_contract(&contract_id, &|| {
@@ -502,7 +502,7 @@ mod tests {
         env.as_contract(&contract_id, &|| {
             env.storage()
                 .instance()
-                .set(&soroban_sdk::vec![&env, soroban_sdk::symbol_short!("ADMIN")], &admin);
+                .set(&make_storage_key(&env, &[b"ADMIN"]), &admin);
         });
 
         let result = env.as_contract(&contract_id, &|| {
@@ -583,7 +583,7 @@ mod tests {
         env.as_contract(&contract_id, &|| {
             env.storage()
                 .instance()
-                .set(&soroban_sdk::vec![&env, soroban_sdk::symbol_short!("ADMIN")], &admin);
+                .set(&make_storage_key(&env, &[b"ADMIN"]), &admin);
         });
 
         let result = env.as_contract(&contract_id, &|| {
