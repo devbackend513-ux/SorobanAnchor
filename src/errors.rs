@@ -113,6 +113,12 @@ pub enum ErrorCode {
     InvalidSessionMetadata    = 52,
     /// Asset code is empty, too long, or contains invalid characters.
     InvalidAssetCode          = 53,
+
+    // URL-not-set errors (56–57)
+    /// Attestor has no endpoint URL set (profile exists but field is empty).
+    EndpointNotSet            = 56,
+    /// Attestor has no webhook URL set (profile exists but field is empty).
+    WebhookUrlNotSet          = 57,
 }
 
 impl ErrorCode {
@@ -174,6 +180,8 @@ impl ErrorCode {
             ErrorCode::InvalidSessionMetadata    => "Session metadata is invalid",
             ErrorCode::InvalidAssetCode          => "Asset code is invalid",
             ErrorCode::QuoteNotFound             => "Quote not found",
+            ErrorCode::EndpointNotSet            => "Attestor endpoint URL has not been set",
+            ErrorCode::WebhookUrlNotSet          => "Attestor webhook URL has not been set",
         }
     }
 }
@@ -348,6 +356,8 @@ impl AnchorKitError {
     pub fn invalid_request_context() -> Self { Self::from_code(ErrorCode::InvalidRequestContext) }
     pub fn invalid_session_metadata() -> Self { Self::from_code(ErrorCode::InvalidSessionMetadata) }
     pub fn quote_not_found() -> Self { Self::from_code(ErrorCode::QuoteNotFound) }
+    pub fn endpoint_not_set() -> Self { Self::from_code(ErrorCode::EndpointNotSet) }
+    pub fn webhook_url_not_set() -> Self { Self::from_code(ErrorCode::WebhookUrlNotSet) }
     pub fn invalid_asset_code(code: &str) -> Self {
         Self::with_context(
             ErrorCode::InvalidAssetCode,
