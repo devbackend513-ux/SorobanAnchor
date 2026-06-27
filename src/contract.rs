@@ -5147,7 +5147,7 @@ impl AnchorKitContract {
         env.storage()
             .persistent()
             .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::CacheNotFound))
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ValidationError))
     }
 
     /// List all anchor clusters.
