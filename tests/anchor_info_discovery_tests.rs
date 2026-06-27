@@ -400,7 +400,7 @@ mod anchor_info_discovery_tests {
             withdrawal_max_amount: 10_000_000,
         };
         // Must not panic — if it does, the XDR-padding bug has regressed.
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, xlm_asset), &3600u64);
+        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, xlm_asset), &3600u64, &no_uri(&env));
         let info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "XLM"));
         assert_eq!(info.issuer, String::from_str(&env, "native"));
 
@@ -420,7 +420,7 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 0,
             withdrawal_max_amount: 0,
         };
-        client2.fetch_anchor_info(&anchor2, &make_toml_with_asset(&env, ab_asset), &3600u64);
+        client2.fetch_anchor_info(&anchor2, &make_toml_with_asset(&env, ab_asset), &3600u64, &no_uri(&env));
         let info2 = client2.get_anchor_asset_info(&anchor2, &String::from_str(&env, "AB"));
         assert_eq!(info2.deposit_fee_fixed, 10);
 
@@ -440,7 +440,7 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 10,
             withdrawal_max_amount: 10_000,
         };
-        client3.fetch_anchor_info(&anchor3, &make_toml_with_asset(&env, a_asset), &3600u64);
+        client3.fetch_anchor_info(&anchor3, &make_toml_with_asset(&env, a_asset), &3600u64, &no_uri(&env));
         let info3 = client3.get_anchor_asset_info(&anchor3, &String::from_str(&env, "A"));
         assert_eq!(info3.withdrawal_fee_fixed, 5);
     }
@@ -627,7 +627,7 @@ mod anchor_info_discovery_tests {
             withdrawal_max_amount: 0,
         };
         // Must not panic
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, asset), &3600u64);
+        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, asset), &3600u64, &no_uri(&env));
         let info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(info.deposit_fee_percent, 0);
     }
@@ -654,7 +654,7 @@ mod anchor_info_discovery_tests {
             withdrawal_max_amount: 0,
         };
         // Must not panic — 10 000 is the inclusive upper bound
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, asset), &3600u64);
+        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, asset), &3600u64, &no_uri(&env));
         let info = client.get_anchor_asset_info(&anchor, &String::from_str(&env, "USDC"));
         assert_eq!(info.deposit_fee_percent, 10_000);
     }
@@ -681,7 +681,7 @@ mod anchor_info_discovery_tests {
             withdrawal_min_amount: 0,
             withdrawal_max_amount: 0,
         };
-        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64);
+        client.fetch_anchor_info(&anchor, &make_toml_with_asset(&env, bad_asset), &3600u64, &no_uri(&env));
     }
 
     /// deposit_min_amount > deposit_max_amount (inverted range) must be rejected.

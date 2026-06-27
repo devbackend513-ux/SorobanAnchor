@@ -184,6 +184,8 @@ impl ErrorCode {
             ErrorCode::QuoteNotFound             => "Quote not found",
             ErrorCode::AuditLogNotFound          => "Audit log not found",
             ErrorCode::TransactionNotFound       => "Transaction record not found",
+            ErrorCode::EndpointNotSet            => "Attestor endpoint is not set",
+            ErrorCode::WebhookUrlNotSet          => "Attestor webhook URL is not set",
         }
     }
 }
@@ -430,6 +432,9 @@ pub type Error = AnchorKitError;
 pub fn normalize_asset_code(code: &str) -> Result<String, AnchorKitError> {
     let trimmed = code.trim();
     if trimmed.is_empty() || trimmed.len() > 12 {
+        return Err(AnchorKitError::invalid_asset_code(code));
+    }
+    if !trimmed.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
         return Err(AnchorKitError::invalid_asset_code(code));
     }
     if !trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
