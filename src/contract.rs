@@ -1,7 +1,6 @@
-use alloc::{string::String as RustString, vec::Vec as RustVec};
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    xdr::ToXdr, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
+    xdr::ToXdr, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 extern crate alloc;
 
@@ -10,7 +9,7 @@ use crate::errors::ErrorCode;
 use crate::rate_limiter::RateLimiter;
 use crate::sep10_jwt;
 use crate::transaction_state_tracker::{OptRecovery, TransactionState, TransactionStateRecord};
-use crate::replay_detection::{self, ReplayMetrics};
+use crate::replay_detection;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -304,6 +303,8 @@ pub struct WeightedRoutingStrategy {
     pub reputation_weight: f32,
 }
 
+const WEIGHT_SUM_TOLERANCE: f32 = 0.01_f32;
+
 impl WeightedRoutingStrategy {
     /// Validate that weights sum to 1.0 (within floating-point tolerance) and are non-negative.
     pub fn validate(&self) -> bool {
@@ -311,7 +312,7 @@ impl WeightedRoutingStrategy {
             return false;
         }
         let sum = self.fee_weight + self.speed_weight + self.reputation_weight;
-        (sum - 1.0_f32).abs() < 1e-4
+        (sum - 1.0_f32).abs() < WEIGHT_SUM_TOLERANCE
     }
 
     /// Compute a normalized composite score in [0.0, 1.0].
@@ -576,6 +577,34 @@ pub struct CachedToml {
     pub toml: StellarToml,
     pub cached_at: u64,
     pub ttl_seconds: u64,
+    /// URI from which this TOML data was sourced (e.g. the stellar.toml URL).
+    /// Set by the caller via `fetch_anchor_info`; empty when not provided.
+    pub source_uri: String,
+    /// Ledger timestamp when the entry was last successfully refreshed.
+    /// Equals `cached_at` on first write; updated on each successful refresh.
+    pub last_refreshed_at: u64,
+}
+
+/// Provenance metadata for a cached anchor TOML entry.
+///
+/// Returned by [`AnchorKitContract::get_anchor_toml_provenance`] so callers
+/// can verify where anchor metadata came from and how fresh it is without
+/// needing to decode the full cached entry.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorTomlProvenance {
+    /// The anchor address this provenance record belongs to.
+    pub anchor: Address,
+    /// URI from which the TOML data was fetched (empty if not provided).
+    pub source_uri: String,
+    /// Ledger timestamp when the entry was first stored (`cached_at`).
+    pub cached_at: u64,
+    /// Ledger timestamp of the most recent successful refresh.
+    pub last_refreshed_at: u64,
+    /// Configured lifetime of the entry in seconds.
+    pub ttl_seconds: u64,
+    /// Age of the cached entry in seconds (relative to current ledger time).
+    pub age_seconds: u64,
 }
 
 const MIN_TEMP_TTL: u32 = 15; // min_temp_entry_ttl - 1
@@ -805,6 +834,33 @@ pub struct AnchorProofRecord {
 /// [`KycRecord`].  Consumers should compare against this constant when reading
 /// stored data to detect version skew.
 pub const SCHEMA_V1: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Supported SEP versions (#353)
+// ---------------------------------------------------------------------------
+
+/// SEP-6: Non-interactive deposit and withdrawal
+pub const SEP_6: u32 = 6;
+/// SEP-10: Stellar Web Authentication (JWT)
+pub const SEP_10: u32 = 10;
+/// SEP-24: Interactive deposit and withdrawal
+pub const SEP_24: u32 = 24;
+/// SEP-38: Anchor Request for Quote (RFQ)
+pub const SEP_38: u32 = 38;
+
+/// Feature flags indicating which SEP capabilities this contract supports.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SepFeatureFlags {
+    /// SEP-6 non-interactive deposit/withdrawal support.
+    pub sep6: bool,
+    /// SEP-10 JWT authentication support.
+    pub sep10: bool,
+    /// SEP-24 interactive deposit/withdrawal support.
+    pub sep24: bool,
+    /// SEP-38 RFQ / firm quote support.
+    pub sep38: bool,
+}
 
 /// Aggregated transaction counts returned by
 /// [`AnchorKitContract::summarize_transactions_by_status`].
@@ -1199,6 +1255,8 @@ impl AnchorKitContract {
         env.storage().persistent().set(&init_key, &true);
         env.storage().persistent().extend_ttl(&init_key, PERSISTENT_TTL, PERSISTENT_TTL);
         env.storage().instance().set(&admin_key(&env), &admin);
+        let schema_key = make_storage_key(&env, &[b"SCHEMAVER"]);
+        env.storage().instance().set(&schema_key, &SCHEMA_V1);
         env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
     }
 
@@ -1424,15 +1482,17 @@ impl AnchorKitContract {
         );
     }
 
-    /// Run post-upgrade migration logic (idempotent).
+    /// Run post-upgrade migration and advance the on-chain schema version.
     ///
-    /// Called after a contract upgrade to perform any necessary data migrations or
-    /// initialization of new storage fields. This function is idempotent — calling it
-    /// multiple times has the same effect as calling it once.
+    /// Must be called after each WASM upgrade to explicitly record the new schema
+    /// version. The version counter is monotonically increasing — each call must
+    /// supply a version strictly greater than the currently stored one.
     ///
     /// # Arguments
     ///
     /// * `env` - The Soroban environment context.
+    /// * `new_schema_version` - The schema version to advance to. Must be > 0 and
+    ///   greater than the currently stored version (returned by `get_schema_version`).
     ///
     /// # Authorization
     ///
@@ -1441,6 +1501,8 @@ impl AnchorKitContract {
     /// # Errors
     ///
     /// Panics with [`ErrorCode::NotInitialized`] if the contract has not been initialized.
+    /// Panics with [`ErrorCode::ValidationError`] if `new_schema_version == 0` or
+    /// `new_schema_version <= current_stored_version`.
     ///
     /// # Examples
     ///
@@ -1449,7 +1511,7 @@ impl AnchorKitContract {
     /// use anchorkit::AnchorKitContract;
     ///
     /// let env = Env::default();
-    /// AnchorKitContract::migrate(env);
+    /// AnchorKitContract::migrate(env, 1u32);
     /// ```
     pub fn migrate(env: Env, new_schema_version: u32) {
         // migrate must not run before initialization
@@ -2616,9 +2678,11 @@ impl AnchorKitContract {
     /// let version = AnchorKitContract::get_service_capability_version(env, anchor);
     /// ```
     pub fn get_service_capability_version(env: Env, anchor: Address) -> u32 {
+        let xdr = anchor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
         env.storage()
             .persistent()
-            .get::<_, AnchorServices>(&(symbol_short!("SERVICES"), anchor))
+            .get::<_, AnchorServices>(&make_storage_key(&env, &[b"SERVICES", &raw]))
             .map(|r| r.service_capability_version)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ServicesNotConfigured))
     }
@@ -2851,40 +2915,58 @@ impl AnchorKitContract {
         payload_hash: Bytes,
         signature: Bytes,
     ) -> u64 {
+        // --- Phase 1: authentication & read-only precondition checks ---
+        // All checks that do NOT write to storage run first. If any fails the
+        // function panics before any storage mutation occurs, leaving the
+        // contract in a consistent state.
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
         Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
-        Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
-        let config = RateLimiter::get_config(&env);
-        if RateLimiter::check_and_increment(&env, &issuer, &config).is_err() {
-            panic_with_error!(&env, ErrorCode::RateLimitExceeded);
-        }
-
+        // Replay check (read-only)
         let issuer_xdr = issuer.clone().to_xdr(&env);
         let issuer_raw = xdr_to_vec(&issuer_xdr);
         let hash_raw = xdr_to_vec(&payload_hash);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
             // Record replay detection event and metrics before panicking
-            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            let replay_event =
+                replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
             replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
+        // Rate-limit check: `enforce_rate_limit` calls `check_and_increment`
+        // which also writes. It comes last among the precondition checks so the
+        // counter is only incremented when every guard has already passed.
+        Self::enforce_rate_limit(&env, &issuer);
+
+        // --- Phase 2: all writes together ---
+        // We reach here only when every precondition is satisfied. Any
+        // out-of-storage budget failure below will abort the entire transaction
+        // and roll back the rate-limit increment along with every other write.
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env, id, issuer.clone(), subject.clone(), timestamp,
-            payload_hash.clone(), signature,
+            &env,
+            id,
+            issuer.clone(),
+            subject.clone(),
+            timestamp,
+            payload_hash.clone(),
+            signature,
         );
-
         env.storage().persistent().set(&used_key, &timestamp);
-        env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
+        env.storage()
+            .persistent()
+            .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
         env.events().publish(
             (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
-            AttestEvent { payload_hash, timestamp },
+            AttestEvent {
+                payload_hash,
+                timestamp,
+            },
         );
         id
     }
@@ -2902,6 +2984,7 @@ impl AnchorKitContract {
         signature: Bytes,
         require_kyc: bool,
     ) -> u64 {
+        // --- Phase 1: authentication & read-only precondition checks ---
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
         Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
@@ -2911,45 +2994,61 @@ impl AnchorKitContract {
             let kyc_status = Self::get_kyc_status(env.clone(), subject.clone());
             if kyc_status != KycStatus::Approved {
                 match kyc_status {
-                    KycStatus::Pending    => panic_with_error!(&env, ErrorCode::KycPending),
-                    KycStatus::Rejected   => panic_with_error!(&env, ErrorCode::KycRejected),
-                    KycStatus::Expired    => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::Pending => panic_with_error!(&env, ErrorCode::KycPending),
+                    KycStatus::Rejected => panic_with_error!(&env, ErrorCode::KycRejected),
+                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                     KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
                     _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                 }
             }
         }
 
+        // Replay check (read-only)
         let issuer_xdr = issuer.clone().to_xdr(&env);
         let issuer_raw = xdr_to_vec(&issuer_xdr);
         let hash_raw = xdr_to_vec(&payload_hash);
         let used_key = make_storage_key(&env, &[b"USED", &issuer_raw, &hash_raw]);
         if env.storage().persistent().has(&used_key) {
-            // Record replay detection event and metrics before panicking
-            let replay_event = replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
+            let replay_event =
+                replay_detection::record_replay_detection(&env, &payload_hash, &issuer);
             replay_detection::emit_replay_detection_log(&env, &replay_event);
             panic_with_error!(&env, ErrorCode::ReplayAttack);
         }
 
+        // Rate-limit check (single call; the earlier double-count was a bug).
+        Self::enforce_rate_limit(&env, &issuer);
+
+        // --- Phase 2: all writes together ---
         let id = Self::next_attestation_id(&env);
         Self::store_attestation(
-            &env, id, issuer.clone(), subject.clone(), timestamp,
-            payload_hash.clone(), signature,
+            &env,
+            id,
+            issuer.clone(),
+            subject.clone(),
+            timestamp,
+            payload_hash.clone(),
+            signature,
         );
-
         env.storage().persistent().set(&used_key, &timestamp);
-        env.storage().persistent().extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
+        env.storage()
+            .persistent()
+            .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
         let _now = env.ledger().timestamp();
         env.events().publish(
             (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
-            AttestEvent { payload_hash: payload_hash.clone(), timestamp },
+            AttestEvent {
+                payload_hash: payload_hash.clone(),
+                timestamp,
+            },
         );
         env.events().publish(
             (symbol_short!("webhook"), symbol_short!("event")),
             WebhookEvent {
                 event_type: String::from_str(&env, "attestation_submitted"),
-                transaction_id: id, timestamp, payload_hash,
+                transaction_id: id,
+                timestamp,
+                payload_hash,
             },
         );
         id
@@ -3624,7 +3723,7 @@ impl AnchorKitContract {
             .storage()
             .persistent()
             .get(&sess_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::SessionNotFound));
         Self::validate_session(&env, &session);
         session.closed = true;
         env.storage().persistent().set(&sess_key, &session);
@@ -3641,7 +3740,7 @@ impl AnchorKitContract {
             .storage()
             .persistent()
             .get(&sess_key)
-            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::SessionNotFound));
         Self::validate_session(env, &session);
         // #232: enforce per-session operation limit
         let op_count: u64 = env
@@ -3783,7 +3882,7 @@ impl AnchorKitContract {
         let anchor_raw = xdr_to_vec(&anchor_xdr);
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         let quote: Quote = env.storage().persistent().get(&q_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound));
         env.events().publish(
             (symbol_short!("quote"), symbol_short!("received"), quote_id),
             QuoteReceivedEvent { quote_id, receiver, timestamp: env.ledger().timestamp() },
@@ -3825,7 +3924,7 @@ impl AnchorKitContract {
         let anchor_raw = xdr_to_vec(&anchor_xdr);
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         let quote: Quote = env.storage().persistent().get(&q_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound));
 
         // #297: Enforce compliance gating if required
         if require_compliance {
@@ -3903,7 +4002,7 @@ impl AnchorKitContract {
         let sess_key = make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]);
         let mut session: Session = env
             .storage().persistent().get(&sess_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::SessionNotFound));
         session.nonce += 1;
         env.storage().persistent().set(&sess_key, &session);
         env.storage().persistent().extend_ttl(&sess_key, PERSISTENT_TTL, PERSISTENT_TTL);
@@ -4067,7 +4166,7 @@ impl AnchorKitContract {
         env.storage()
             .persistent()
             .get::<_, Session>(&make_storage_key(&env, &[b"SESS", &session_id.to_be_bytes()]))
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound))
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::SessionNotFound))
     }
 
     pub fn get_audit_log(env: Env, log_id: u64) -> AuditLog {
@@ -4511,7 +4610,7 @@ impl AnchorKitContract {
         let anchor_raw = xdr_to_vec(&anchor_xdr);
         let key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         env.storage().persistent().get::<_, Quote>(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::NoQuotesAvailable))
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound))
     }
 
     pub fn set_anchor_metadata(
@@ -4919,7 +5018,7 @@ impl AnchorKitContract {
 
             // Filter by amount limits
             if options.request.amount < quote.minimum_amount
-                || options.request.amount > quote.maximum_amount
+                || (quote.maximum_amount != 0 && options.request.amount > quote.maximum_amount)
             {
                 continue;
             }
@@ -4942,6 +5041,20 @@ impl AnchorKitContract {
                 .unwrap_or(false);
             if !passed {
                 panic_with_error!(&env, ErrorCode::ComplianceNotMet);
+            }
+        }
+
+        // Enforce KYC check (#439)
+        if options.require_kyc {
+            let kyc_status = Self::get_kyc_status(env.clone(), options.subject.clone());
+            if kyc_status != KycStatus::Approved {
+                match kyc_status {
+                    KycStatus::Pending      => panic_with_error!(&env, ErrorCode::KycPending),
+                    KycStatus::Rejected     => panic_with_error!(&env, ErrorCode::KycRejected),
+                    KycStatus::Expired      => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
+                    _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                }
             }
         }
 
@@ -5037,6 +5150,14 @@ impl AnchorKitContract {
         max_results: u32,
         min_reputation: u32,
     ) -> Vec<Quote> {
+        if fee_weight
+            .checked_add(speed_weight)
+            .and_then(|sum| sum.checked_add(reputation_weight))
+            != Some(1000)
+        {
+            panic_with_error!(&env, ErrorCode::InvalidWeights);
+        }
+
         let fw = fee_weight as f32 / 1000.0_f32;
         let sw = speed_weight as f32 / 1000.0_f32;
         let rw = reputation_weight as f32 / 1000.0_f32;
@@ -5046,7 +5167,7 @@ impl AnchorKitContract {
             reputation_weight: rw,
         };
         if !strategy.validate() {
-            panic_with_error!(&env, ErrorCode::ValidationError);
+            panic_with_error!(&env, ErrorCode::InvalidWeights);
         }
 
         let now = env.ledger().timestamp();
@@ -5132,11 +5253,22 @@ impl AnchorKitContract {
     // Anchor Info Discovery
     // -----------------------------------------------------------------------
 
+    /// Cache the anchor's stellar.toml data along with provenance information.
+    ///
+    /// # Arguments
+    ///
+    /// * `anchor` - The anchor whose metadata is being cached.
+    /// * `toml_data` - Parsed stellar.toml payload.
+    /// * `ttl_seconds` - How long (in seconds) the entry is considered fresh.
+    ///   Pass `0` to use the contract-level `capabilities_ttl_seconds`.
+    /// * `source_uri` - The URL from which `toml_data` was fetched. Pass an
+    ///   empty string if the source is unknown or not applicable.
     pub fn fetch_anchor_info(
         env: Env,
         anchor: Address,
         toml_data: StellarToml,
         ttl_seconds: u64,
+        source_uri: String,
     ) {
         anchor.require_auth();
         for asset in toml_data.currencies.iter() {
@@ -5149,22 +5281,60 @@ impl AnchorKitContract {
             toml: toml_data,
             cached_at: now,
             ttl_seconds: ttl,
+            source_uri,
+            last_refreshed_at: now,
         };
         let key = (symbol_short!("TOMLCACHE"), anchor.clone());
-        let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL { ttl as u32 } else { MIN_TEMP_TTL };
+        let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL {
+            ttl as u32
+        } else {
+            MIN_TEMP_TTL
+        };
         env.storage().temporary().set(&key, &cached);
-        env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, ledger_ttl, ledger_ttl);
     }
 
     pub fn get_anchor_toml(env: Env, anchor: Address) -> StellarToml {
         let key = (symbol_short!("TOMLCACHE"), anchor);
-        let cached: CachedToml = env.storage().temporary().get(&key)
+        let cached: CachedToml = env
+            .storage()
+            .temporary()
+            .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::CacheNotFound));
         let now = env.ledger().timestamp();
         if cached.cached_at + cached.ttl_seconds <= now {
             panic_with_error!(&env, ErrorCode::CacheExpired);
         }
         cached.toml
+    }
+
+    /// Return provenance metadata for the anchor's cached stellar.toml entry.
+    ///
+    /// Panics with `CacheNotFound` when no entry exists, or `CacheExpired`
+    /// when the entry has passed its TTL. Callers should check freshness
+    /// first, or use `try_get_anchor_toml_provenance` via the SDK client.
+    pub fn get_anchor_toml_provenance(env: Env, anchor: Address) -> AnchorTomlProvenance {
+        let key = (symbol_short!("TOMLCACHE"), anchor.clone());
+        let cached: CachedToml = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::CacheNotFound));
+        let now = env.ledger().timestamp();
+        if cached.cached_at + cached.ttl_seconds <= now {
+            panic_with_error!(&env, ErrorCode::CacheExpired);
+        }
+        let age_seconds = now.saturating_sub(cached.cached_at);
+        AnchorTomlProvenance {
+            anchor,
+            source_uri: cached.source_uri,
+            cached_at: cached.cached_at,
+            last_refreshed_at: cached.last_refreshed_at,
+            ttl_seconds: cached.ttl_seconds,
+            age_seconds,
+        }
     }
 
     pub fn refresh_anchor_info(env: Env, anchor: Address) {
@@ -5512,9 +5682,11 @@ impl AnchorKitContract {
     /// `SERVICE_QUOTES`. Used by routing (#238) to exclude anchors that do not
     /// advertise the quote service before scoring.
     fn advertises_quote_service(env: &Env, anchor: &Address) -> bool {
+        let xdr = anchor.clone().to_xdr(env);
+        let raw = xdr_to_vec(&xdr);
         env.storage()
             .persistent()
-            .get::<_, AnchorServices>(&(symbol_short!("SERVICES"), anchor.clone()))
+            .get::<_, AnchorServices>(&make_storage_key(env, &[b"SERVICES", &raw]))
             .map(|s| s.services.contains(&SERVICE_QUOTES))
             .unwrap_or(false)
     }
@@ -6036,6 +6208,8 @@ impl AnchorKitContract {
     /// should call this after every outbound anchor interaction.
     pub fn record_health_event(env: Env, anchor: Address, success: bool) {
         Self::require_admin(&env);
+        anchor.require_auth();
+        Self::check_attestor(&env, &anchor);
         let key = Self::health_metrics_key(&env, &anchor);
         let now = env.ledger().timestamp();
 
@@ -6144,39 +6318,50 @@ impl AnchorKitContract {
     /// a registered attestor.
     /// Panics with [`ErrorCode::InvalidEndpointFormat`] when `endpoint` fails
     /// HTTPS domain validation.
-    pub fn register_endpoint_proof(
-        env: Env,
-        anchor: Address,
-        endpoint: String,
-        proof_hash: BytesN<32>,
-    ) {
-        anchor.require_auth();
-        Self::check_attestor(&env, &anchor);
+   pub fn register_endpoint_proof(
+    env: Env,
+    anchor: Address,
+    endpoint: String,
+    proof_hash: BytesN<32>,
+) {
+    anchor.require_auth();
+    Self::check_attestor(&env, &anchor);
 
-        // Validate the endpoint URL before storing.
-        let endpoint_str = Self::soroban_string_to_rust_string(&env, &endpoint);
-        crate::validate_anchor_domain(&endpoint_str)
-            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
+    // Validate the endpoint URL before storing.
+    let endpoint_str = Self::soroban_string_to_rust_string(&env, &endpoint);
+    crate::validate_anchor_domain(&endpoint_str)
+        .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
 
-        let now = env.ledger().timestamp();
-        let record = AnchorProofRecord {
-            anchor: anchor.clone(),
-            endpoint,
-            proof_hash,
-            registered_at: now,
-            verified: false,
-        };
-        let key = Self::pop_key(&env, &anchor);
-        env.storage().persistent().set(&key, &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+    // SECURITY FIX (#420):
+    // Ensure the proof is registered for the same endpoint configured
+    // in the attestor profile via set_endpoint(), when an endpoint has
+    // already been configured.
+    let profile = Self::load_or_init_profile(&env, &anchor);
 
-        env.events().publish(
-            (symbol_short!("pop"), symbol_short!("register"), anchor),
-            now,
-        );
+    if profile.endpoint.len() != 0 && profile.endpoint != endpoint {
+        panic_with_error!(&env, ErrorCode::ValidationError);
     }
+
+    let now = env.ledger().timestamp();
+    let record = AnchorProofRecord {
+        anchor: anchor.clone(),
+        endpoint,
+        proof_hash,
+        registered_at: now,
+        verified: false,
+    };
+
+    let key = Self::pop_key(&env, &anchor);
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+    env.events().publish(
+        (symbol_short!("pop"), symbol_short!("register"), anchor),
+        now,
+    );
+}
 
     /// Verify a proof-of-possession by comparing `proof_hash` against the
     /// stored record for `anchor`.
@@ -6266,5 +6451,61 @@ impl AnchorKitContract {
     /// Returns 0 if no replay attempts have been recorded for this ID.
     pub fn get_replay_count_for_id(env: Env, request_id: Bytes) -> u64 {
         replay_detection::get_replay_count_for_id(&env, &request_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // SEP version & feature flag introspection (#353)
+    // -----------------------------------------------------------------------
+
+    /// Return the list of SEP version numbers explicitly supported by this contract.
+    ///
+    /// # Returns
+    ///
+    /// A [`Vec<u32>`] containing the SEP numbers: `[6, 10, 24, 38]`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use soroban_sdk::Env;
+    /// use anchorkit::contract::{AnchorKitContract, SEP_6, SEP_10, SEP_24, SEP_38};
+    ///
+    /// let env = Env::default();
+    /// let seps = AnchorKitContract::supported_seps(env);
+    /// assert!(seps.contains(&SEP_6));
+    /// ```
+    pub fn supported_seps(env: Env) -> Vec<u32> {
+        let mut v = Vec::new(&env);
+        v.push_back(SEP_6);
+        v.push_back(SEP_10);
+        v.push_back(SEP_24);
+        v.push_back(SEP_38);
+        v
+    }
+
+    /// Return a [`SepFeatureFlags`] struct indicating which SEP capabilities
+    /// this contract supports.
+    ///
+    /// # Returns
+    ///
+    /// A [`SepFeatureFlags`] with all current support flags set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use soroban_sdk::Env;
+    /// use anchorkit::contract::AnchorKitContract;
+    ///
+    /// let env = Env::default();
+    /// let flags = AnchorKitContract::supported_sep_feature_flags(env);
+    /// assert!(flags.sep10);
+    /// ```
+    pub fn supported_sep_feature_flags(env: Env) -> SepFeatureFlags {
+        let _ = env;
+        SepFeatureFlags {
+            sep6: true,
+            sep10: true,
+            sep24: true,
+            sep38: true,
+        }
     }
 }

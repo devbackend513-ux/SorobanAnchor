@@ -152,6 +152,28 @@ anchorkit attest --subject GUSER123... --payload-hash abc123...
 anchorkit doctor
 ```
 
+## Supported SEP Versions
+
+The contract explicitly exposes which Stellar Ecosystem Proposals (SEPs) it supports via two on-chain methods:
+
+```rust
+// Returns [6, 10, 24, 38]
+let seps: Vec<u32> = AnchorKitContract::supported_seps(env);
+
+// Returns per-SEP boolean flags
+let flags: SepFeatureFlags = AnchorKitContract::supported_sep_feature_flags(env);
+assert!(flags.sep10); // SEP-10 JWT authentication is supported
+```
+
+| SEP | Description | Supported |
+|-----|-------------|-----------|
+| [SEP-6](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0006.md) | Non-interactive deposit and withdrawal | ✓ |
+| [SEP-10](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md) | Stellar Web Authentication (JWT) | ✓ |
+| [SEP-24](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md) | Interactive deposit and withdrawal | ✓ |
+| [SEP-38](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0038.md) | Anchor RFQ / firm quotes | ✓ |
+
+Constants are also exported from the `contract` module: `SEP_6`, `SEP_10`, `SEP_24`, `SEP_38`.
+
 ## Key APIs
 
 ```rust
@@ -276,7 +298,48 @@ SorobanAnchor follows a documented governance and security model covering:
 
 Full details: [`docs/governance-and-security.md`](docs/governance-and-security.md)
 
+## Production Release Status
+
+SorobanAnchor v0.1.0 is **production-ready**. The following verification and cleanup have been completed for this release:
+
+### Build Matrix
+- **Native (std):** `cargo build --release` — clean build, CLI binary produced
+- **WASM (no_std):** `cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm` — clean build, optimized WASM produced
+- **no_std verification:** `cargo check --no-default-features` passes
+
+### Test Coverage
+| Area | Status |
+|------|--------|
+| Feature gate combinations | All 8 documented combinations verified |
+| Integration harness (local) | `cargo test --test cli_integration_harness` passes |
+| Stress tests | `cargo test --features stress-tests` passes |
+| Config validation | `./scripts/validate_all.sh` against all 6 example configs |
+| Build matrix | `./scripts/test_build_matrix.sh` passes |
+
+### Documentation & Cleanup
+- All docs reviewed and updated for API accuracy
+- Stale example scripts removed (`logging_demo.sh`, `anchor_routing_example.sh`)
+- Error code references synced between `src/errors.rs`, `docs/error-codes.md`, and `docs/CONTRACT_FUNCTIONS.md`
+- Build target docs aligned with actual `Makefile` targets
+- Script path resolution bugs fixed in `pre_deploy_validate.sh`, `pre_deploy_validate.ps1`, `validate_all.sh`, `validate_all.ps1`
+- Dead code removed from `ci_preflight_check.sh`, `verify_anchor_info_discovery.sh`
+- `generate_hash_vectors.sh` fixed (function declaration ordering, reliable openssl fallback)
+- Coverage script test file references corrected
+
+### Release Artifacts
+```bash
+make release            # Build and bundle release artifacts
+make release-validate   # Validate the release bundle
+```
+
+The release bundle includes:
+- `anchorkit` — Native CLI binary
+- `anchorkit.wasm` — Soroban WASM contract (optimized)
+- `schemas/config_schema.json` — JSON schema
+- `configs/` — Example anchor configurations
+- `docs/` — Full documentation set
+- `README.md`, `LICENSE`, `VERSION`
+
 ## License
 
 MIT
-# sorobanAnchor

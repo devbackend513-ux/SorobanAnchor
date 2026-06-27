@@ -168,7 +168,7 @@ pub use errors::Error;
 pub use rate_limiter::{RateLimiter, RateLimitConfig, RateLimitState};
 pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
-pub use contract::{AnchorKitContract, EndpointUpdated, CacheConfig};
+pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
 pub use transaction_state_tracker::{TransactionState, TransactionStateRecord, RecoveryMetadata, OptRecovery};
 pub use transaction_state_tracker::{StorageBudgetMonitor, TransactionStateTracker};
 pub use transaction_state_tracker::TransactionSummary;

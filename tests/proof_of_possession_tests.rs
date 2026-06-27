@@ -58,12 +58,12 @@ mod proof_of_possession_tests {
     /// the `check_attestor` guard. We bypass the SEP-10 check by using a
     /// direct storage write via the contract's `register_attestor`-free path
     /// — in tests we mock all auths so we can call the admin method directly.
-    fn register_attestor(client: &AnchorKitContractClient, env: &Env, anchor: &Address) {
+    fn register_attestor(client: &AnchorKitContractClient, env: &Env, anchor: &Address, admin: &Address) {
         // Use the session-based registration which doesn't require a live SEP-10 token.
-        // We create a session first, then register within it.
-        let session_id = client.create_session(anchor);
+        // The contract requires an admin or attestor-admin operator for this path.
+        let session_id = client.create_session(admin);
         let pk = BytesN::from_array(env, &[0xABu8; 32]);
-        client.register_attestor_with_session(anchor, &session_id, anchor, &pk);
+        client.register_attestor_with_session(admin, &session_id, anchor, &pk);
     }
 
     fn make_proof_hash(env: &Env, challenge: &[u8; 32], endpoint: &str) -> BytesN<32> {
@@ -143,9 +143,9 @@ mod proof_of_possession_tests {
     fn register_and_retrieve_proof_record() {
         let env = make_env();
         set_ledger(&env, 1000);
-        let (client, _) = deploy(&env);
+        let (client, admin) = deploy(&env);
         let anchor = Address::generate(&env);
-        register_attestor(&client, &env, &anchor);
+        register_attestor(&client, &env, &anchor, &admin);
 
         let challenge = b"test_challenge_bytes_32_chars___";
         let endpoint_str = "https://anchor.example.com";
@@ -166,9 +166,9 @@ mod proof_of_possession_tests {
     fn verify_endpoint_proof_returns_true_on_match() {
         let env = make_env();
         set_ledger(&env, 1000);
-        let (client, _) = deploy(&env);
+        let (client, admin) = deploy(&env);
         let anchor = Address::generate(&env);
-        register_attestor(&client, &env, &anchor);
+        register_attestor(&client, &env, &anchor, &admin);
 
         let challenge = b"test_challenge_bytes_32_chars___";
         let endpoint_str = "https://anchor.example.com";
@@ -185,9 +185,9 @@ mod proof_of_possession_tests {
     fn verify_endpoint_proof_marks_record_as_verified() {
         let env = make_env();
         set_ledger(&env, 1000);
-        let (client, _) = deploy(&env);
+        let (client, admin) = deploy(&env);
         let anchor = Address::generate(&env);
-        register_attestor(&client, &env, &anchor);
+        register_attestor(&client, &env, &anchor, &admin);
 
         let challenge = b"test_challenge_bytes_32_chars___";
         let endpoint_str = "https://anchor.example.com";
@@ -205,9 +205,9 @@ mod proof_of_possession_tests {
     fn verify_endpoint_proof_returns_false_on_hash_mismatch() {
         let env = make_env();
         set_ledger(&env, 1000);
-        let (client, _) = deploy(&env);
+        let (client, admin) = deploy(&env);
         let anchor = Address::generate(&env);
-        register_attestor(&client, &env, &anchor);
+        register_attestor(&client, &env, &anchor, &admin);
 
         let challenge = b"test_challenge_bytes_32_chars___";
         let endpoint_str = "https://anchor.example.com";
@@ -237,9 +237,9 @@ mod proof_of_possession_tests {
     fn re_registering_proof_overwrites_previous_record() {
         let env = make_env();
         set_ledger(&env, 1000);
-        let (client, _) = deploy(&env);
+        let (client, admin) = deploy(&env);
         let anchor = Address::generate(&env);
-        register_attestor(&client, &env, &anchor);
+        register_attestor(&client, &env, &anchor, &admin);
 
         let endpoint_str = "https://anchor.example.com";
         let endpoint = String::from_str(&env, endpoint_str);
@@ -267,12 +267,29 @@ mod proof_of_possession_tests {
     }
 
     #[test]
+    fn register_endpoint_proof_rejects_mismatched_configured_endpoint() {
+        let env = make_env();
+        set_ledger(&env, 1000);
+        let (client, admin) = deploy(&env);
+        let anchor = Address::generate(&env);
+        register_attestor(&client, &env, &anchor, &admin);
+
+        let configured_endpoint = String::from_str(&env, "https://anchor.example.com");
+        let mismatched_endpoint = String::from_str(&env, "https://evil.example.com");
+        client.set_endpoint(&anchor, &configured_endpoint);
+
+        let proof_hash = BytesN::from_array(&env, &[0xABu8; 32]);
+        let result = client.try_register_endpoint_proof(&anchor, &mismatched_endpoint, &proof_hash);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn register_endpoint_proof_rejects_non_https_endpoint() {
         let env = make_env();
         set_ledger(&env, 1000);
-        let (client, _) = deploy(&env);
+        let (client, admin) = deploy(&env);
         let anchor = Address::generate(&env);
-        register_attestor(&client, &env, &anchor);
+        register_attestor(&client, &env, &anchor, &admin);
 
         let bad_endpoint = String::from_str(&env, "http://anchor.example.com");
         let proof_hash = BytesN::from_array(&env, &[0xABu8; 32]);
@@ -289,9 +306,9 @@ mod proof_of_possession_tests {
     fn end_to_end_pop_flow() {
         let env = make_env();
         set_ledger(&env, 1000);
-        let (client, _) = deploy(&env);
+        let (client, admin) = deploy(&env);
         let anchor = Address::generate(&env);
-        register_attestor(&client, &env, &anchor);
+        register_attestor(&client, &env, &anchor, &admin);
 
         // Step 1: anchor publishes challenge in stellar.toml (simulated here)
         let challenge: [u8; 32] = *b"prod_challenge_bytes_32_chars___";
