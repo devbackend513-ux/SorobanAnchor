@@ -36,7 +36,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "0aca6f4ca391a805207406f4469dffbff625d1012e393429c1c3aeb84a22e5cb"
+                  "bytes": "0f1a1301bc9277fb892fa3399681ab1b41323cd08ce94ad3f1d7b5dd4a457dac"
                 }
               ]
             }
@@ -58,13 +58,13 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImV4cCI6ODc0MDAsImlzcyI6Imh0dHBzOi8vYW5jaG9yLmV4YW1wbGUuY29tIn0.aMY5q5zuZErNSGQbtXaAmeVuuj51ZVGZXij1fpghu6mTMx8Cf-sI-5ytN7ER9l14Nh-Tkh0xseAW8AGxvaMWAg"
+                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImlhdCI6MTAwMCwiZXhwIjo4NzQwMCwiaXNzIjoiaHR0cHM6Ly9hbmNob3IuZXhhbXBsZS5jb20ifQ.a7p1bBp4wkjlkknL6bU1Fr9b36QwtAAJleMeBu2yl6ZT5O8NwmQ7MyYrsXQUJRcg0hfRUx7KT_V1yTkyic_UCQ"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "0aca6f4ca391a805207406f4469dffbff625d1012e393429c1c3aeb84a22e5cb"
+                  "bytes": "0f1a1301bc9277fb892fa3399681ab1b41323cd08ce94ad3f1d7b5dd4a457dac"
                 }
               ]
             }
@@ -117,7 +117,7 @@
                   "bytes": "7061796c6f61645f686173685f33326200000000000007d00000000000000000"
                 },
                 {
-                  "bytes": "611c7ff1761147a7d38e2389f26a88ced7841a2552e9c6789c8a614781f86d7c7d6e51f0beaf4a01a00380d88212f83af545d79d2dd91b56978ddd51d0e37f0c"
+                  "bytes": "6673fba2b3116a7d5aee8e83bb473419fa9653117a3f54ba880d100bc9d7aebc0b673d5e3fca9854e5ff7cf75de2aa9dede14d8d3022d8242da91fe69d36fd07"
                 }
               ]
             }
@@ -192,7 +192,7 @@
                   "bytes": "7061796c6f61645f686173685f3332620000000000000bb80000000000000000"
                 },
                 {
-                  "bytes": "996dcf8f5b86493ef83bd18c6fb631836acfc0f11256550155a72587e4d579cf330ac977df3b9e48331cade9adddefcd4f489b53932e06fdb1841f5de2da7403"
+                  "bytes": "fced93a334d931be91d1b331f479da18acede28b88ef35635e00dcfb2fe1e3970f6c1d4444552750b6ce765cfdd4baee61aa1dcc120f4f7e6360b925462a2803"
                 }
               ]
             }
@@ -446,7 +446,7 @@
                         "symbol": "signature"
                       },
                       "val": {
-                        "bytes": "996dcf8f5b86493ef83bd18c6fb631836acfc0f11256550155a72587e4d579cf330ac977df3b9e48331cade9adddefcd4f489b53932e06fdb1841f5de2da7403"
+                        "bytes": "fced93a334d931be91d1b331f479da18acede28b88ef35635e00dcfb2fe1e3970f6c1d4444552750b6ce765cfdd4baee61aa1dcc120f4f7e6360b925462a2803"
                       }
                     },
                     {
@@ -496,7 +496,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "0aca6f4ca391a805207406f4469dffbff625d1012e393429c1c3aeb84a22e5cb"
+                  "bytes": "0f1a1301bc9277fb892fa3399681ab1b41323cd08ce94ad3f1d7b5dd4a457dac"
                 }
               }
             },
@@ -613,7 +613,7 @@
                         "symbol": "signature"
                       },
                       "val": {
-                        "bytes": "611c7ff1761147a7d38e2389f26a88ced7841a2552e9c6789c8a614781f86d7c7d6e51f0beaf4a01a00380d88212f83af545d79d2dd91b56978ddd51d0e37f0c"
+                        "bytes": "6673fba2b3116a7d5aee8e83bb473419fa9653117a3f54ba880d100bc9d7aebc0b673d5e3fca9854e5ff7cf75de2aa9dede14d8d3022d8242da91fe69d36fd07"
                       }
                     },
                     {
@@ -996,37 +996,6 @@
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "key": {
-              "bytes": "b3397e6dd98298415f7bec5f9960f57d86aeeb744e09cef50baca6c115c91df7"
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "bytes": "b3397e6dd98298415f7bec5f9960f57d86aeeb744e09cef50baca6c115c91df7"
-                },
-                "durability": "persistent",
-                "val": {
-                  "u64": 0
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          1555200
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
               "bytes": "b4cc7d729f7a79536ac69f3734ea4d40e582c1f5559610781b9cbdcafff45a72"
             },
             "durability": "persistent"
@@ -1137,38 +1106,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "0aca6f4ca391a805207406f4469dffbff625d1012e393429c1c3aeb84a22e5cb"
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          1555200
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "bytes": "e74688839e422c4815bd441e9fa98695504f8664a9ab176c863d0ef388265079"
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "bytes": "e74688839e422c4815bd441e9fa98695504f8664a9ab176c863d0ef388265079"
-                },
-                "durability": "persistent",
-                "val": {
-                  "u64": 0
+                  "bytes": "0f1a1301bc9277fb892fa3399681ab1b41323cd08ce94ad3f1d7b5dd4a457dac"
                 }
               }
             },
@@ -1353,6 +1291,102 @@
                       },
                       {
                         "key": {
+                          "symbol": "ADMIN_AUDIT_CNT"
+                        },
+                        "val": {
+                          "u64": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "ADMIN_AUDIT"
+                            },
+                            {
+                              "u64": 0
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "admin"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "change_type"
+                              },
+                              "val": {
+                                "string": "register_attestor"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "entry_id"
+                              },
+                              "val": {
+                                "u64": 0
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "error_message"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "new_value"
+                              },
+                              "val": {
+                                "string": "registered"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "old_value"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "status"
+                              },
+                              "val": {
+                                "string": "success"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "target"
+                              },
+                              "val": {
+                                "string": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "timestamp"
+                              },
+                              "val": {
+                                "u64": 1000
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
                           "vec": [
                             {
                               "symbol": "ATCNT"
@@ -1382,7 +1416,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ],
       [
@@ -1700,7 +1734,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ]
     ]
@@ -1777,7 +1811,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "0aca6f4ca391a805207406f4469dffbff625d1012e393429c1c3aeb84a22e5cb"
+                  "bytes": "0f1a1301bc9277fb892fa3399681ab1b41323cd08ce94ad3f1d7b5dd4a457dac"
                 }
               ]
             }
@@ -1831,13 +1865,112 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImV4cCI6ODc0MDAsImlzcyI6Imh0dHBzOi8vYW5jaG9yLmV4YW1wbGUuY29tIn0.aMY5q5zuZErNSGQbtXaAmeVuuj51ZVGZXij1fpghu6mTMx8Cf-sI-5ytN7ER9l14Nh-Tkh0xseAW8AGxvaMWAg"
+                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImlhdCI6MTAwMCwiZXhwIjo4NzQwMCwiaXNzIjoiaHR0cHM6Ly9hbmNob3IuZXhhbXBsZS5jb20ifQ.a7p1bBp4wkjlkknL6bU1Fr9b36QwtAAJleMeBu2yl6ZT5O8NwmQ7MyYrsXQUJRcg0hfRUx7KT_V1yTkyic_UCQ"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "0aca6f4ca391a805207406f4469dffbff625d1012e393429c1c3aeb84a22e5cb"
+                  "bytes": "0f1a1301bc9277fb892fa3399681ab1b41323cd08ce94ad3f1d7b5dd4a457dac"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "admin"
+              },
+              {
+                "symbol": "audit"
+              },
+              {
+                "u64": 0
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "admin"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "change_type"
+                  },
+                  "val": {
+                    "string": "register_attestor"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "entry_id"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "error_message"
+                  },
+                  "val": {
+                    "string": ""
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "new_value"
+                  },
+                  "val": {
+                    "string": "registered"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "old_value"
+                  },
+                  "val": {
+                    "string": ""
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "status"
+                  },
+                  "val": {
+                    "string": "success"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "target"
+                  },
+                  "val": {
+                    "string": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "timestamp"
+                  },
+                  "val": {
+                    "u64": 1000
+                  }
                 }
               ]
             }
@@ -2027,7 +2160,7 @@
                   "bytes": "7061796c6f61645f686173685f33326200000000000007d00000000000000000"
                 },
                 {
-                  "bytes": "611c7ff1761147a7d38e2389f26a88ced7841a2552e9c6789c8a614781f86d7c7d6e51f0beaf4a01a00380d88212f83af545d79d2dd91b56978ddd51d0e37f0c"
+                  "bytes": "6673fba2b3116a7d5aee8e83bb473419fa9653117a3f54ba880d100bc9d7aebc0b673d5e3fca9854e5ff7cf75de2aa9dede14d8d3022d8242da91fe69d36fd07"
                 }
               ]
             }
@@ -2413,7 +2546,7 @@
                   "bytes": "7061796c6f61645f686173685f3332620000000000000bb80000000000000000"
                 },
                 {
-                  "bytes": "996dcf8f5b86493ef83bd18c6fb631836acfc0f11256550155a72587e4d579cf330ac977df3b9e48331cade9adddefcd4f489b53932e06fdb1841f5de2da7403"
+                  "bytes": "fced93a334d931be91d1b331f479da18acede28b88ef35635e00dcfb2fe1e3970f6c1d4444552750b6ce765cfdd4baee61aa1dcc120f4f7e6360b925462a2803"
                 }
               ]
             }

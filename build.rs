@@ -109,13 +109,18 @@ fn validate_schema_consistency() {
         ("\"maximum\": 10000", "MAX_OPERATIONS"),
     ];
 
+    let mut schema_failed = false;
     for (schema_val, const_name) in checks {
         if !schema_content.contains(schema_val) {
             println!(
-                "cargo:warning=Schema consistency check: {} might not match {}",
+                "cargo:warning=Schema mismatch: {} expected {} in schema",
                 const_name, schema_val
             );
+            schema_failed = true;
         }
+    }
+    if schema_failed {
+        panic!("Schema consistency check failed — update config_schema.json to match Rust constants");
     }
 
     println!("cargo:warning=✓ Schema consistency validated");

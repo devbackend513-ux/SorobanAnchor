@@ -12,7 +12,7 @@
 
 mod contract_init_upgrade_tests {
     use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
-    use soroban_sdk::{Address, BytesN, Env, IntoVal};
+    use soroban_sdk::{Address, Bytes, BytesN, Env, IntoVal};
 
     use anchorkit::contract::{AnchorKitContract, AnchorKitContractClient};
     use anchorkit::errors::ErrorCode;
@@ -48,9 +48,23 @@ mod contract_init_upgrade_tests {
         (client, admin)
     }
 
-    /// A non-zero 32-byte hash suitable for upgrade tests.
+    /// Upload a minimal valid Soroban WASM and return its hash.
+    ///
+    /// The WASM contains only the required `contractenvmetav0` custom section
+    /// so that `update_current_contract_wasm` can resolve the hash in tests.
     fn dummy_wasm_hash(env: &Env) -> BytesN<32> {
-        BytesN::from_array(env, &[0xAB; 32])
+        // Minimal Soroban WASM: magic + version + custom section "contractenvmetav0" + empty XDR vec
+        let wasm: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x00, 0x16,             // custom section (id=0), size=22
+            0x11,                   // name length = 17
+            // "contractenvmetav0"
+            0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74,
+            0x65, 0x6e, 0x76, 0x6d, 0x65, 0x74, 0x61, 0x76, 0x30,
+            0x00, 0x00, 0x00, 0x00, // empty XDR vec (length = 0)
+        ];
+        env.deployer().upload_contract_wasm(Bytes::from_slice(env, wasm))
     }
 
     // -----------------------------------------------------------------------
@@ -123,8 +137,7 @@ mod contract_init_upgrade_tests {
         let (client, admin) = deploy(&env);
         client.initialize(&admin);
 
-        // In the test environment update_current_contract_wasm is a no-op,
-        // so we just verify the call completes without panic.
+        // Verify the call completes without panic when admin is authorized.
         client.upgrade(&dummy_wasm_hash(&env));
     }
 
@@ -210,10 +223,11 @@ mod contract_init_upgrade_tests {
         let (client, admin) = deploy(&env);
         client.initialize(&admin);
 
-        assert_eq!(client.get_schema_version(), 0);
-
-        client.migrate(&1u32);
+        // initialize() sets SCHEMAVER = SCHEMA_V1 = 1
         assert_eq!(client.get_schema_version(), 1);
+
+        client.migrate(&2u32);
+        assert_eq!(client.get_schema_version(), 2);
 
         client.migrate(&5u32);
         assert_eq!(client.get_schema_version(), 5);
@@ -342,6 +356,6 @@ mod contract_init_upgrade_tests {
         let (client, admin) = deploy(&env);
         client.initialize(&admin);
 
-        assert_eq!(client.get_schema_version(), 0);
+        assert_eq!(client.get_schema_version(), 1);
     }
 }

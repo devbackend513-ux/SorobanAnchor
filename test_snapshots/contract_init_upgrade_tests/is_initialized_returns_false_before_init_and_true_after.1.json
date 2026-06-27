@@ -307,7 +307,7 @@
               }
             ],
             "data": {
-              "bool": false
+              "bool": true
             }
           }
         }

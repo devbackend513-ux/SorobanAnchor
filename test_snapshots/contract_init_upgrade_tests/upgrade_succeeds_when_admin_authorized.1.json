@@ -22,8 +22,7 @@
           "sub_invocations": []
         }
       ]
-    ],
-    []
+    ]
   ],
   "ledger": {
     "protocol_version": 21,
@@ -228,138 +227,16 @@
           "v0": {
             "topics": [
               {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
-              },
-              {
-                "symbol": "upgrade"
-              }
-            ],
-            "data": {
-              "bytes": "abababababababababababababababababababababababababababababababab"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
                 "symbol": "error"
               },
               {
                 "error": {
-                  "storage": "missing_value"
+                  "context": "exceeded_limit"
                 }
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "Wasm does not exist"
-                },
-                {
-                  "bytes": "abababababababababababababababababababababababababababababababab"
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "storage": "missing_value"
-                }
-              }
-            ],
-            "data": {
-              "string": "escalating error to panic"
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "storage": "missing_value"
-                }
-              }
-            ],
-            "data": {
-              "string": "caught error from function"
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "storage": "missing_value"
-                }
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "string": "contract call failed"
-                },
-                {
-                  "symbol": "upgrade"
-                },
-                {
-                  "vec": [
-                    {
-                      "bytes": "abababababababababababababababababababababababababababababababab"
-                    }
-                  ]
-                }
-              ]
+              "string": "LengthLimitExceeded"
             }
           }
         }
@@ -379,7 +256,7 @@
               },
               {
                 "error": {
-                  "storage": "missing_value"
+                  "context": "exceeded_limit"
                 }
               }
             ],

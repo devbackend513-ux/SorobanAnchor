@@ -11,7 +11,7 @@
 
 mod migration_tests {
     use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
-    use soroban_sdk::{Address, BytesN, Env, IntoVal};
+    use soroban_sdk::{Address, Bytes, BytesN, Env, IntoVal};
 
     use anchorkit::contract::{AnchorKitContract, AnchorKitContractClient, Attestation, Quote};
     use anchorkit::errors::ErrorCode;
@@ -47,7 +47,14 @@ mod migration_tests {
     }
 
     fn dummy_wasm_hash(env: &Env) -> BytesN<32> {
-        BytesN::from_array(env, &[0xAB; 32])
+        let wasm: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x16, 0x11,
+            0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74,
+            0x65, 0x6e, 0x76, 0x6d, 0x65, 0x74, 0x61, 0x76, 0x30,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        env.deployer().upload_contract_wasm(Bytes::from_slice(env, wasm))
     }
 
     fn dummy_payload_hash(env: &Env) -> soroban_sdk::Bytes {

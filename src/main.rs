@@ -9,7 +9,6 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::io::Read;
 use anchorkit::normalize_stellar_account_id;
-use anchorkit::config::secure_read_config_file;
 
 // ── SecretKey wrapper ─────────────────────────────────────────────────────────
 //
@@ -229,7 +228,7 @@ fn dirs_home() -> std::path::PathBuf {
 }
 
 fn secure_read_file(path: &str) -> Result<String, std::io::Error> {
-    secure_read_config_file(std::path::Path::new(path))
+    std::fs::read_to_string(path)
 }
 
 fn load_network_profiles() -> Vec<NetworkProfile> {
@@ -1043,7 +1042,7 @@ fn register(
         "register_attestor",
         "--attestor", &address,
         "--sep10_token", sep10_token,
-        "--sep10_issuer", sep10_issuer,
+        "--sep10_issuer", &sep10_issuer,
         "--public_key", &pk_hex,
     ]);
     stellar_invoke(contract_id, source, network, &[
