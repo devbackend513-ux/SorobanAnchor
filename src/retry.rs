@@ -203,8 +203,7 @@ impl JitterSource for MockJitterSource {
 pub fn is_retryable(code: crate::errors::ErrorCode) -> bool {
     use crate::errors::ErrorCode;
     match code {
-        ErrorCode::ServicesNotConfigured
-        | ErrorCode::AttestationNotFound
+        ErrorCode::AttestationNotFound
         | ErrorCode::StaleQuote
         | ErrorCode::NoQuotesAvailable
         | ErrorCode::CacheExpired
