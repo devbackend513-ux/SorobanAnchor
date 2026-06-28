@@ -36,7 +36,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "d89128a3cb4cb9c00f27172cb03d6c83a818e563d8e5652e0ef7dfe081bbd366"
+                  "bytes": "9492d94a2b4f7d29b839622ac4151c047a473f5feff0c183cc51af417008233a"
                 }
               ]
             }
@@ -58,13 +58,13 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImV4cCI6MTA4NjQwMCwiaXNzIjoiaHR0cHM6Ly9hbmNob3IuZXhhbXBsZS5jb20ifQ.cUNh-hSMdDYqcm0lYs22gtuTj9I8sU-t20zbnsk56oCRLlJ3A7H5Ag2LUSMENuxToMpcOByJddfO8uCsEX8pDw"
+                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImlhdCI6MTAwMDAwMCwiZXhwIjoxMDg2NDAwLCJpc3MiOiJodHRwczovL2FuY2hvci5leGFtcGxlLmNvbSJ9.njKbleMLGTsWXOGBks4bzFmuD1DxEGP-Aw0hasUQquMjTSJAyHaaZPQjNAdd2XcWU4LdZVkX6Qrh6k5uK7FsDA"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "d89128a3cb4cb9c00f27172cb03d6c83a818e563d8e5652e0ef7dfe081bbd366"
+                  "bytes": "9492d94a2b4f7d29b839622ac4151c047a473f5feff0c183cc51af417008233a"
                 }
               ]
             }
@@ -107,7 +107,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "d89128a3cb4cb9c00f27172cb03d6c83a818e563d8e5652e0ef7dfe081bbd366"
+                  "bytes": "9492d94a2b4f7d29b839622ac4151c047a473f5feff0c183cc51af417008233a"
                 }
               }
             },
@@ -169,7 +169,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "d89128a3cb4cb9c00f27172cb03d6c83a818e563d8e5652e0ef7dfe081bbd366"
+                  "bytes": "9492d94a2b4f7d29b839622ac4151c047a473f5feff0c183cc51af417008233a"
                 }
               }
             },
@@ -250,6 +250,102 @@
                       },
                       {
                         "key": {
+                          "symbol": "ADMIN_AUDIT_CNT"
+                        },
+                        "val": {
+                          "u64": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "ADMIN_AUDIT"
+                            },
+                            {
+                              "u64": 0
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "admin"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "change_type"
+                              },
+                              "val": {
+                                "string": "register_attestor"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "entry_id"
+                              },
+                              "val": {
+                                "u64": 0
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "error_message"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "new_value"
+                              },
+                              "val": {
+                                "string": "registered"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "old_value"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "status"
+                              },
+                              "val": {
+                                "string": "success"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "target"
+                              },
+                              "val": {
+                                "string": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "timestamp"
+                              },
+                              "val": {
+                                "u64": 1000000
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
                           "vec": [
                             {
                               "symbol": "ATCNT"
@@ -267,7 +363,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ],
       [
@@ -387,7 +483,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ]
     ]
@@ -464,7 +560,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "d89128a3cb4cb9c00f27172cb03d6c83a818e563d8e5652e0ef7dfe081bbd366"
+                  "bytes": "9492d94a2b4f7d29b839622ac4151c047a473f5feff0c183cc51af417008233a"
                 }
               ]
             }
@@ -518,13 +614,112 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImV4cCI6MTA4NjQwMCwiaXNzIjoiaHR0cHM6Ly9hbmNob3IuZXhhbXBsZS5jb20ifQ.cUNh-hSMdDYqcm0lYs22gtuTj9I8sU-t20zbnsk56oCRLlJ3A7H5Ag2LUSMENuxToMpcOByJddfO8uCsEX8pDw"
+                  "string": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJDQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBSEszTSIsImlhdCI6MTAwMDAwMCwiZXhwIjoxMDg2NDAwLCJpc3MiOiJodHRwczovL2FuY2hvci5leGFtcGxlLmNvbSJ9.njKbleMLGTsWXOGBks4bzFmuD1DxEGP-Aw0hasUQquMjTSJAyHaaZPQjNAdd2XcWU4LdZVkX6Qrh6k5uK7FsDA"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "bytes": "d89128a3cb4cb9c00f27172cb03d6c83a818e563d8e5652e0ef7dfe081bbd366"
+                  "bytes": "9492d94a2b4f7d29b839622ac4151c047a473f5feff0c183cc51af417008233a"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "admin"
+              },
+              {
+                "symbol": "audit"
+              },
+              {
+                "u64": 0
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "admin"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "change_type"
+                  },
+                  "val": {
+                    "string": "register_attestor"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "entry_id"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "error_message"
+                  },
+                  "val": {
+                    "string": ""
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "new_value"
+                  },
+                  "val": {
+                    "string": "registered"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "old_value"
+                  },
+                  "val": {
+                    "string": ""
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "status"
+                  },
+                  "val": {
+                    "string": "success"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "target"
+                  },
+                  "val": {
+                    "string": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "timestamp"
+                  },
+                  "val": {
+                    "u64": 1000000
+                  }
                 }
               ]
             }
@@ -611,7 +806,7 @@
                   "bytes": "abababababababababababababababababababababababababababababababab"
                 },
                 {
-                  "bytes": "4cf01466a9ed0f9518961af1970498e99ce99ea01fc242b155f916fa3f42652f62fc9fd79aa9ef92e610ceb16d28fed2116498f3cf59f9a6218b23c8a02c1806"
+                  "bytes": "4270b262a02e631608612645f40d4bfed3cdea0eeb7bef58448f3624e5f429075c63441eb7869fd678ca1fc98b3e4956b022cbe69f55e783d64db00ac5be5308"
                 }
               ]
             }
@@ -735,7 +930,7 @@
                       "bytes": "abababababababababababababababababababababababababababababababab"
                     },
                     {
-                      "bytes": "4cf01466a9ed0f9518961af1970498e99ce99ea01fc242b155f916fa3f42652f62fc9fd79aa9ef92e610ceb16d28fed2116498f3cf59f9a6218b23c8a02c1806"
+                      "bytes": "4270b262a02e631608612645f40d4bfed3cdea0eeb7bef58448f3624e5f429075c63441eb7869fd678ca1fc98b3e4956b022cbe69f55e783d64db00ac5be5308"
                     }
                   ]
                 }

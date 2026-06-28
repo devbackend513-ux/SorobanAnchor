@@ -78,16 +78,17 @@ pub struct AnchorInfoResponse {
 /// ```rust
 /// use anchorkit::validate_deposit_response;
 ///
-/// let resp = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 2_000_000_000).unwrap();
+/// let resp = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000).unwrap();
 /// assert_eq!(resp.transaction_id, "dep_123");
 ///
-/// assert!(validate_deposit_response("", "pending", "GDEPOSIT...", 2_000_000_000).is_err());
+/// assert!(validate_deposit_response("", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000).is_err());
 /// ```
 pub fn validate_deposit_response(
     transaction_id: &str,
     status: &str,
     deposit_address: &str,
     expires_at: u64,
+    now_unix: u64,
 ) -> Result<DepositResponse, Error> {
     if transaction_id.is_empty() {
         return Err(Error::validation_error("transaction_id is empty"));
@@ -101,10 +102,9 @@ pub fn validate_deposit_response(
     if deposit_address.is_empty() {
         return Err(Error::validation_error("deposit_address is empty"));
     }
-    // expires_at must be 0 (no expiry) or a future Unix timestamp.
-    // We use a compile-time lower bound of 1_700_000_000 (Nov 2023) as a
-    // proxy for "past" when we cannot call the system clock in no_std.
-    if expires_at != 0 && expires_at < 1_700_000_000 {
+    // expires_at must be 0 (no expiry) or a timestamp strictly in the future
+    // relative to the caller-supplied now_unix.
+    if expires_at != 0 && expires_at <= now_unix {
         return Err(Error::validation_error("expires_at is in the past"));
     }
 
@@ -511,6 +511,36 @@ fn is_valid_quote_status(status: &str) -> bool {
     matches!(status, "quoted" | "pending" | "expired" | "error")
 }
 
+/// A validated transaction status response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionStatusResponseValidated {
+    pub transaction_id: alloc::string::String,
+    pub status: alloc::string::String,
+    pub kind: alloc::string::String,
+}
+
+/// Validates a raw transaction status response.
+pub fn validate_transaction_status_response(
+    transaction_id: &str,
+    status: &str,
+    kind: &str,
+) -> Result<TransactionStatusResponseValidated, Error> {
+    if transaction_id.is_empty() {
+        return Err(Error::validation_error("transaction_id is empty"));
+    }
+    if status.is_empty() {
+        return Err(Error::validation_error("status is empty"));
+    }
+    if kind.is_empty() {
+        return Err(Error::validation_error("kind is empty"));
+    }
+    Ok(TransactionStatusResponseValidated {
+        transaction_id: alloc::string::String::from(transaction_id),
+        status: alloc::string::String::from(status),
+        kind: alloc::string::String::from(kind),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_valid_deposit_response() {
-        let result = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 2_000_000_000);
+        let result = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000);
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.transaction_id, "dep_123");
@@ -530,37 +560,45 @@ mod tests {
 
     #[test]
     fn test_deposit_missing_transaction_id() {
-        let result = validate_deposit_response("", "pending", "GDEPOSIT...", 2_000_000_000);
+        let result = validate_deposit_response("", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_deposit_missing_status() {
-        let result = validate_deposit_response("dep_123", "", "GDEPOSIT...", 2_000_000_000);
+        let result = validate_deposit_response("dep_123", "", "GDEPOSIT...", 2_000_000_000, 1_700_000_000);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_deposit_invalid_status() {
-        let result = validate_deposit_response("dep_123", "garbage_status", "GDEPOSIT...", 2_000_000_000);
+        let result = validate_deposit_response("dep_123", "garbage_status", "GDEPOSIT...", 2_000_000_000, 1_700_000_000);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_deposit_missing_deposit_address() {
-        let result = validate_deposit_response("dep_123", "pending", "", 2_000_000_000);
+        let result = validate_deposit_response("dep_123", "pending", "", 2_000_000_000, 1_700_000_000);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_deposit_zero_expires_at_is_valid() {
-        // expires_at = 0 is a valid u64; only string fields are required
-        let result = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 0);
+        // expires_at = 0 means no expiry; always accepted regardless of now_unix
+        let result = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 0, 1_700_000_000);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_deposit_expires_at_in_past_rejected() {
+        // expires_at <= now_unix must be rejected
+        let result = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 1_000_000_000, 2_000_000_000);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     // --- validate_withdraw_response ---
@@ -764,7 +802,7 @@ mod tests {
     #[test]
     fn test_validation_error_does_not_panic() {
         // Simulates SDK consumer handling the error gracefully
-        let result = validate_deposit_response("", "", "", 0);
+        let result = validate_deposit_response("", "", "", 0, 0);
         match result {
             Err(e) if e.code == crate::errors::ErrorCode::ValidationError => { /* handled, no crash */ }
             _ => panic!("Expected ValidationError"),
@@ -918,22 +956,22 @@ mod tests {
 
     #[test]
     fn test_deposit_past_expires_at_rejected() {
-        // 1_000_000 is well before Nov 2023 — treated as past
-        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 1_000_000);
+        // expires_at <= now_unix is treated as past
+        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 1_000_000, 2_000_000_000);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_deposit_future_expires_at_accepted() {
-        // 2_000_000_000 is year ~2033
-        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 2_000_000_000);
+        // 2_000_000_000 > 1_700_000_000 (now)
+        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 2_000_000_000, 1_700_000_000);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_deposit_zero_expires_at_accepted() {
         // 0 means "no expiry"
-        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 0);
+        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 0, 1_700_000_000);
         assert!(result.is_ok());
     }
 }

@@ -250,7 +250,7 @@ pub fn mock_deposit_response_full() -> RawDepositResponse {
         fee_fixed: Some(5),
         status: Some("pending_external".to_string()),
         clawback_enabled: Some(true),
-        stellar_memo: Some("FULLMEMO".to_string()),
+        stellar_memo: Some("a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3".to_string()),
         stellar_memo_type: Some("hash".to_string()),
         asset_code: Some("USDC".to_string()),
     }
